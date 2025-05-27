@@ -8,12 +8,14 @@ pub mod config;
 pub mod commands;
 pub mod discovery;
 pub mod logging;
+pub mod status;
 pub mod system_monitor;
 
 use config::Config;
 use commands::handle_button_press;
-use discovery::{setup_button_discovery, setup_sensor_discovery, StateManager};
+use discovery::{setup_button_discovery, setup_sensor_discovery, setup_status_discovery};
 use logging::init_tracing;
+use status::StatusManager;
 use system_monitor::SystemMonitor;
 
 #[tokio::main]
@@ -55,15 +57,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_sensor_discovery(&client, &config).await?;
     debug!("Sensor discovery completed");
     
-    // Create state manager and publish initial state
-    // debug!("Creating state manager");
-    // let state_manager = StateManager::new(config.hostname.clone(), client.clone());
-    // debug!("Publishing initial 'On' state");
-    // if let Err(e) = state_manager.publish_on().await {
-    //     warn!("Failed to publish initial state: {}", e);
-    // } else {
-    //     debug!("Successfully published initial state");
-    // }
+    // Setup status sensor discovery
+    debug!("Setting up status discovery");
+    setup_status_discovery(&client, &config).await?;
+    debug!("Status discovery completed");
+    
+    // Create status manager and publish initial status
+    debug!("Creating status manager");
+    let status_manager = StatusManager::new(config.hostname.clone(), client.clone());
+    debug!("Publishing initial 'On' status");
+    if let Err(e) = status_manager.publish_on().await {
+        warn!("Failed to publish initial status: {}", e);
+    } else {
+        debug!("Successfully published initial status");
+    }
     
     // Create system monitor
     info!("Starting system monitor");
@@ -111,19 +118,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = signal::ctrl_c() => {
                 info!("Ctrl-C received, shutting down gracefully.");
-                // Publish "Off" state before shutting down
-                // if let Err(e) = state_manager.publish_off().await {
-                //     error!("Failed to publish off state: {}", e);
-                // }
+                // Publish "Off" status before shutting down
+                if let Err(e) = status_manager.publish_off().await {
+                    error!("Failed to publish off status: {}", e);
+                }
                 break;
             }
         }
     }
 
-    // // Ensure we publish "Off" state before exiting
-    // if let Err(e) = state_manager.publish_off().await {
-    //     error!("Failed to publish final off state: {}", e);
-    // }
+    // Ensure we publish "Off" status before exiting
+    if let Err(e) = status_manager.publish_off().await {
+        error!("Failed to publish final off status: {}", e);
+    }
     
     info!("MQTT daemon shut down.");
     Ok(())

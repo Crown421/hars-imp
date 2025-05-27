@@ -1,61 +1,9 @@
 use rumqttc::{AsyncClient, QoS};
 use serde::Serialize;
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
-use tokio::time::{timeout, Duration};
+use tracing::{debug, info};
 use crate::config::Config;
 use crate::system_monitor::SYSTEM_METRICS;
-
-#[derive(Serialize)]
-struct StateData {
-    state: String,
-}
-
-pub struct StateManager {
-    hostname: String,
-    client: AsyncClient,
-}
-
-impl StateManager {
-    pub fn new(hostname: String, client: AsyncClient) -> Self {
-        Self { hostname, client }
-    }
-
-    pub async fn publish_state(&self, state: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let state_data = StateData { 
-            state: state.to_string() 
-        };
-        let state_json = serde_json::to_string(&state_data)?;
-        let state_topic = format!("homeassistant/sensor/{}/state/state", self.hostname);
-        
-        info!("Publishing state: {}", state);
-        
-        // Add timeout to prevent hanging
-        match timeout(Duration::from_secs(5), 
-                     self.client.publish(&state_topic, QoS::AtMostOnce, false, state_json)).await {
-            Ok(result) => result?,
-            Err(_) => {
-                warn!("Timeout publishing state '{}' to topic '{}'", state, state_topic);
-                return Err("Timeout publishing state".into());
-            }
-        }
-        
-        debug!("Successfully published state: {}", state);
-        Ok(())
-    }
-
-    pub async fn publish_on(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.publish_state("On").await
-    }
-
-    pub async fn publish_off(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.publish_state("Off").await
-    }
-
-    pub async fn publish_suspended(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.publish_state("Suspended").await
-    }
-}
 
 #[derive(Serialize)]
 pub struct HomeAssistantDiscovery {
@@ -122,6 +70,18 @@ pub struct HomeAssistantDevice {
     pub sw_version: String,
 }
 
+/// Creates a shared HomeAssistant device object using the hostname from config
+/// and the version from Cargo.toml at compile time
+fn create_shared_device(config: &Config) -> HomeAssistantDevice {
+    HomeAssistantDevice {
+        identifiers: config.hostname.clone(),
+        name: config.hostname.clone(),
+        model: "MQTT Daemon".to_string(),
+        manufacturer: "Custom".to_string(),
+        sw_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
 pub async fn setup_button_discovery(
     client: &AsyncClient,
     config: &Config,
@@ -141,13 +101,7 @@ pub async fn setup_button_discovery(
                 name: button.name.clone(),
                 command_topic: button_topic.clone(),
                 unique_id: format!("{}_{}", config.hostname, button.name.replace(" ", "_").to_lowercase()),
-                device: HomeAssistantDevice {
-                    identifiers: config.hostname.clone(),
-                    name: config.hostname.clone(),
-                    model: "MQTT Daemon".to_string(),
-                    manufacturer: "Custom".to_string(),
-                    sw_version: "1.0.0".to_string(),
-                },
+                device: create_shared_device(config),
             };
             
             let discovery_json = serde_json::to_string(&discovery_message)?;
@@ -172,17 +126,11 @@ pub async fn setup_sensor_discovery(
     client: &AsyncClient,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let device = HomeAssistantDevice {
-        identifiers: config.hostname.clone(),
-        name: config.hostname.clone(),
-        model: "MQTT Daemon".to_string(),
-        manufacturer: "Custom".to_string(),
-        sw_version: "1.0.0".to_string(),
-    };
+    let device = create_shared_device(config);
 
     let origin = HomeAssistantOrigin {
         name: "MQTT Agent".to_string(),
-        sw_version: "1.0.0".to_string(),
+        sw_version: env!("CARGO_PKG_VERSION").to_string(),
         support_url: "https://github.com/your-repo/mqtt-agent".to_string(),
     };
 
@@ -217,6 +165,34 @@ pub async fn setup_sensor_discovery(
     
     info!("Publishing device discovery for '{}' to: {}", config.hostname, discovery_topic);
     info!("Device discovery payload: {}", discovery_json);
+    client.publish(&discovery_topic, QoS::AtLeastOnce, true, discovery_json).await?;
+
+    Ok(())
+}
+
+pub async fn setup_status_discovery(
+    client: &AsyncClient,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let device = create_shared_device(config);
+
+    // Create status sensor discovery
+    let status_discovery = HomeAssistantSensorDiscovery {
+        name: format!("{} Status", config.hostname),
+        state_topic: format!("homeassistant/sensor/{}/status/state", config.hostname),
+        unique_id: format!("{}_status", config.hostname),
+        device_class: None,
+        unit_of_measurement: None,
+        value_template: "{{ value_json.status }}".to_string(),
+        device,
+    };
+
+    // Publish status sensor discovery message
+    let discovery_topic = format!("homeassistant/sensor/{}_status/config", config.hostname);
+    let discovery_json = serde_json::to_string(&status_discovery)?;
+    
+    info!("Publishing status sensor discovery for '{}' to: {}", config.hostname, discovery_topic);
+    debug!("Status discovery payload: {}", discovery_json);
     client.publish(&discovery_topic, QoS::AtLeastOnce, true, discovery_json).await?;
 
     Ok(())
