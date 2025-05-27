@@ -11,6 +11,10 @@ A minimal and efficient Rust daemon for listening to MQTT topics and processing 
 - Automatic reconnection on connection failures
 - **Home Assistant button integration with auto-discovery**
 - **Execute shell commands via button presses**
+- **System monitoring with Home Assistant sensor discovery**
+  - CPU load percentage (reported every 60 seconds)
+  - CPU frequency (if available)
+  - Memory usage: total RAM, free RAM in GB, and free percentage (reported every 30 seconds)
 
 ## Configuration
 
@@ -78,6 +82,39 @@ For a device with hostname `hp-steffen` and a button named `Suspend`:
 - **Command topic**: `homeassistant/button/hp-steffen_suspend/set`
 
 The daemon will automatically handle the naming and topic generation.
+
+### System Monitoring Sensors
+
+The daemon automatically creates Home Assistant sensors for system monitoring:
+
+#### CPU Monitoring
+- **CPU Load**: Reports system load average (1-minute) as a percentage
+  - Topic: `homeassistant/sensor/{hostname}/cpu_load/state`
+  - Update interval: 60 seconds
+  - Unit: %
+
+- **CPU Frequency**: Reports current CPU frequency (if available)
+  - Topic: `homeassistant/sensor/{hostname}/cpu_frequency/state`
+  - Update interval: 60 seconds
+  - Unit: MHz
+
+#### Memory Monitoring
+- **Memory Total**: Total system RAM
+  - Topic: `homeassistant/sensor/{hostname}/memory_total/state`
+  - Update interval: 30 seconds
+  - Unit: GB
+
+- **Memory Free**: Available system RAM
+  - Topic: `homeassistant/sensor/{hostname}/memory_free/state`
+  - Update interval: 30 seconds
+  - Unit: GB
+
+- **Memory Free %**: Free memory percentage
+  - Topic: `homeassistant/sensor/{hostname}/memory_free_pct/state`
+  - Update interval: 30 seconds
+  - Unit: %
+
+All sensors are automatically discovered by Home Assistant and include proper device associations.
 
 ## Running as a System Service
 
