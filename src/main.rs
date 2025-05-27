@@ -1,6 +1,7 @@
 use rumqttc::{MqttOptions, AsyncClient, QoS, Event, Packet};
 use std::time::Duration;
 use tokio::time;
+use tokio::signal; // Add this line
 use tracing::{info, warn, error, debug, trace};
 
 pub mod config;
@@ -58,30 +59,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Main event loop
     info!("Starting main event loop");
     loop {
-        match eventloop.poll().await {
-            Ok(Event::Incoming(Packet::Publish(publish))) => {
-                let topic = &publish.topic;
-                let payload = String::from_utf8_lossy(&publish.payload);
-                trace!("Received message on topic '{}': {}", topic, payload);
-                
-                // Check if this is a button press
-                let button_handled = handle_button_press(topic, &payload, &button_topics).await;
-                
-                // If not a button press, treat as regular message
-                if !button_handled {
-                    info!("Message on topic '{}': {}", topic, payload);
+        tokio::select! {
+            res = eventloop.poll() => {
+                match res {
+                    Ok(notification) => {
+                        match notification {
+                            Event::Incoming(Packet::Publish(publish)) => {
+                                let topic = &publish.topic;
+                                let payload = String::from_utf8_lossy(&publish.payload);
+                                trace!("Received message on topic '{}': {}", topic, payload);
+                                
+                                // Check if this is a button press
+                                let button_handled = handle_button_press(topic, &payload, &button_topics).await;
+                                
+                                // If not a button press, treat as regular message
+                                if !button_handled {
+                                    info!("Message on topic '{}': {}", topic, payload);
+                                }
+                            }
+                            event => {
+                                // Other events (connections, pings, etc.)
+                                debug!("MQTT event: {:?}", event);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("MQTT error: {}", e);
+                        warn!("Waiting {}ms before retrying", config.update_interval_ms);
+                        // Wait a bit before retrying
+                        time::sleep(Duration::from_millis(config.update_interval_ms)).await;
+                    }
                 }
             }
-            Ok(event) => {
-                // Other events (connections, pings, etc.)
-                debug!("MQTT event: {:?}", event);
-            }
-            Err(e) => {
-                error!("MQTT error: {}", e);
-                warn!("Waiting {}ms before retrying", config.update_interval_ms);
-                // Wait a bit before retrying
-                time::sleep(Duration::from_millis(config.update_interval_ms)).await;
+            _ = signal::ctrl_c() => {
+                info!("Ctrl-C received, shutting down gracefully.");
+                break;
             }
         }
     }
+
+    info!("MQTT daemon shut down.");
+    Ok(())
 }
