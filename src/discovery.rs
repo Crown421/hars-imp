@@ -5,6 +5,22 @@ use tracing::{debug, info};
 use crate::config::Config;
 use crate::system_monitor::SYSTEM_METRICS;
 
+/// Generic function to publish Home Assistant discovery messages
+pub async fn publish_discovery<T: Serialize>(
+    client: &AsyncClient,
+    discovery_topic: &str,
+    discovery_payload: &T,
+    retain: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let discovery_json = serde_json::to_string(discovery_payload)?;
+    
+    info!("Publishing discovery to: {}", discovery_topic);
+    debug!("Discovery payload: {}", discovery_json);
+    client.publish(discovery_topic, QoS::AtLeastOnce, retain, discovery_json).await?;
+    
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub struct HomeAssistantDiscovery {
     pub name: String,
@@ -104,12 +120,9 @@ pub async fn setup_button_discovery(
                 device: create_shared_device(config),
             };
             
-            let discovery_json = serde_json::to_string(&discovery_message)?;
-            
             // Publish discovery message
-            info!("Publishing discovery for button '{}' to: {}", button.name, discovery_topic);
-            debug!("Discovery payload: {}", discovery_json);
-            client.publish(&discovery_topic, QoS::AtLeastOnce, true, discovery_json).await?;
+            info!("Publishing discovery for button '{}'", button.name);
+            publish_discovery(client, &discovery_topic, &discovery_message, true).await?;
             
             // Subscribe to button command topic
             info!("Subscribing to button topic: {}", button_topic);
@@ -161,11 +174,9 @@ pub async fn setup_sensor_discovery(
 
     // Publish single device discovery message
     let discovery_topic = format!("homeassistant/device/{}/config", config.hostname);
-    let discovery_json = serde_json::to_string(&device_discovery)?;
     
-    info!("Publishing device discovery for '{}' to: {}", config.hostname, discovery_topic);
-    info!("Device discovery payload: {}", discovery_json);
-    client.publish(&discovery_topic, QoS::AtLeastOnce, true, discovery_json).await?;
+    info!("Publishing device discovery for '{}'", config.hostname);
+    publish_discovery(client, &discovery_topic, &device_discovery, true).await?;
 
     Ok(())
 }
@@ -189,11 +200,9 @@ pub async fn setup_status_discovery(
 
     // Publish status sensor discovery message
     let discovery_topic = format!("homeassistant/sensor/{}_status/config", config.hostname);
-    let discovery_json = serde_json::to_string(&status_discovery)?;
     
-    info!("Publishing status sensor discovery for '{}' to: {}", config.hostname, discovery_topic);
-    debug!("Status discovery payload: {}", discovery_json);
-    client.publish(&discovery_topic, QoS::AtLeastOnce, true, discovery_json).await?;
+    info!("Publishing status sensor discovery for '{}'", config.hostname);
+    publish_discovery(client, &discovery_topic, &status_discovery, true).await?;
 
     Ok(())
 }

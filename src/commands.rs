@@ -1,12 +1,12 @@
-use std::process::Command;
 use tracing::{debug, error, info};
 
-pub fn execute_command(command: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub async fn execute_command(command: &str) -> Result<String, Box<dyn std::error::Error>> {
     debug!("Executing command: {}", command);
-    let output = Command::new("sh")
+    let output = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(command)
-        .output()?;
+        .output()
+        .await?;
     
     if output.status.success() {
         let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -28,7 +28,7 @@ pub async fn handle_button_press(
         if topic == button_topic && payload.trim() == "PRESS" {
             info!("Button press detected on topic '{}', executing: {}", topic, exec_command);
             
-            match execute_command(exec_command) {
+            match execute_command(exec_command).await {
                 Ok(output) => {
                     info!("Command executed successfully: {}", output);
                 }
