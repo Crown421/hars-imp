@@ -9,6 +9,8 @@ A minimal and efficient Rust daemon for listening to MQTT topics and processing 
 - Subscribes to multiple topics
 - Prints received messages with timestamps
 - Automatic reconnection on connection failures
+- **Home Assistant button integration with auto-discovery**
+- **Execute shell commands via button presses**
 
 ## Configuration
 
@@ -28,6 +30,19 @@ topics = [                         # List of topics to subscribe to
 ]
 
 update_interval_ms = 5000          # Reconnection interval (ms)
+
+# Home Assistant Buttons (optional)
+[[button]]
+name = "Suspend"                   # Button name shown in Home Assistant
+exec = "systemctl suspend"         # Shell command to execute on button press
+
+[[button]]
+name = "Reboot"
+exec = "sudo reboot"
+
+[[button]]
+name = "Update System"
+exec = "sudo apt update && sudo apt upgrade -y"
 ```
 
 ## Building and Running
@@ -46,6 +61,23 @@ update_interval_ms = 5000          # Reconnection interval (ms)
    ```bash
    ./target/release/mqtt-daemon
    ```
+
+## Home Assistant Integration
+
+The daemon automatically publishes Home Assistant discovery messages for configured buttons. When you start the daemon:
+
+1. **Discovery**: The daemon publishes discovery messages to `homeassistant/button/{hostname}_{button_name}/config`
+2. **Button Creation**: Home Assistant automatically creates button entities
+3. **Button Press**: When pressed in Home Assistant, it sends "PRESS" to `homeassistant/button/{hostname}_{button_name}/set`
+4. **Command Execution**: The daemon executes the configured shell command
+
+### Button Topics
+
+For a device with hostname `hp-steffen` and a button named `Suspend`:
+- **Discovery topic**: `homeassistant/button/hp-steffen_suspend/config`
+- **Command topic**: `homeassistant/button/hp-steffen_suspend/set`
+
+The daemon will automatically handle the naming and topic generation.
 
 ## Running as a System Service
 
@@ -80,3 +112,4 @@ WantedBy=multi-user.target
 - `serde` - Serialization framework
 - `toml` - TOML parser
 - `chrono` - Date and time handling
+- `serde_json` - JSON serialization for Home Assistant discovery
