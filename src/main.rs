@@ -4,6 +4,8 @@ use std::fs;
 use std::time::Duration;
 use std::process::Command;
 use tokio::time;
+use tracing::{info, warn, error, debug, trace};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[derive(Deserialize, Debug)]
 struct Button {
@@ -18,6 +20,7 @@ struct Config {
     mqtt_port: u16,
     username: String,
     password: String,
+    log_level: String,
     topics: Vec<String>,
     update_interval_ms: u64,
     button: Option<Vec<Button>>,
@@ -47,13 +50,29 @@ impl Config {
     }
 }
 
+fn init_tracing(log_level: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let filter = EnvFilter::try_new(log_level)
+        .or_else(|_| EnvFilter::try_new("info"))?;
+    
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(filter)
+        .init();
+    
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration
     let config = Config::load_from_file("config.toml")?;
     
-    println!("Starting MQTT daemon for hostname: {}", config.hostname);
-    println!("Connecting to MQTT broker: {}:{}", config.mqtt_url, config.mqtt_port);
+    // Initialize tracing with the configured log level
+    init_tracing(&config.log_level)?;
+    
+    info!("Starting MQTT daemon for hostname: {}", config.hostname);
+    info!("Connecting to MQTT broker: {}:{}", config.mqtt_url, config.mqtt_port);
+    debug!("Log level set to: {}", config.log_level);
     
     // Set up MQTT options
     let mut mqttoptions = MqttOptions::new(&config.hostname, &config.mqtt_url, config.mqtt_port);
@@ -65,13 +84,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Subscribe to regular topics
     for topic in &config.topics {
-        println!("Subscribing to topic: {}", topic);
+        info!("Subscribing to topic: {}", topic);
         client.subscribe(topic, QoS::AtMostOnce).await?;
     }
     
     // Handle button discovery and subscription
     let mut button_topics = Vec::new();
     if let Some(buttons) = &config.button {
+        debug!("Setting up {} button(s)", buttons.len());
         for button in buttons {
             let button_topic = format!("homeassistant/button/{}/set", 
                                      format!("{}_{}", config.hostname, button.name.replace(" ", "_").to_lowercase()));
@@ -94,11 +114,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let discovery_json = serde_json::to_string(&discovery_message)?;
             
             // Publish discovery message
-            println!("Publishing discovery for button '{}' to: {}", button.name, discovery_topic);
+            info!("Publishing discovery for button '{}' to: {}", button.name, discovery_topic);
+            debug!("Discovery payload: {}", discovery_json);
             client.publish(&discovery_topic, QoS::AtLeastOnce, true, discovery_json).await?;
             
             // Subscribe to button command topic
-            println!("Subscribing to button topic: {}", button_topic);
+            info!("Subscribing to button topic: {}", button_topic);
             client.subscribe(&button_topic, QoS::AtMostOnce).await?;
             
             button_topics.push((button_topic, button.exec.clone()));
@@ -106,29 +127,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // Main event loop
+    info!("Starting main event loop");
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(publish))) => {
                 let topic = &publish.topic;
                 let payload = String::from_utf8_lossy(&publish.payload);
+                trace!("Received message on topic '{}': {}", topic, payload);
                 
                 // Check if this is a button press
                 let mut button_handled = false;
                 for (button_topic, exec_command) in &button_topics {
                     if topic == button_topic && payload.trim() == "PRESS" {
-                        println!("[{}] Button press detected on topic '{}', executing: {}", 
-                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                            topic, 
-                            exec_command
-                        );
+                        info!("Button press detected on topic '{}', executing: {}", topic, exec_command);
                         
                         // Execute the command
                         match execute_command(exec_command) {
                             Ok(output) => {
-                                println!("Command executed successfully: {}", output);
+                                info!("Command executed successfully: {}", output);
                             }
                             Err(e) => {
-                                eprintln!("Failed to execute command '{}': {}", exec_command, e);
+                                error!("Failed to execute command '{}': {}", exec_command, e);
                             }
                         }
                         button_handled = true;
@@ -138,18 +157,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 // If not a button press, treat as regular message
                 if !button_handled {
-                    println!("[{}] Message on topic '{}': {}", 
-                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                        topic, 
-                        payload
-                    );
+                    info!("Message on topic '{}': {}", topic, payload);
                 }
             }
-            Ok(_) => {
-                // Other events (connections, pings, etc.) - we can ignore for now
+            Ok(event) => {
+                // Other events (connections, pings, etc.)
+                debug!("MQTT event: {:?}", event);
             }
             Err(e) => {
-                eprintln!("MQTT error: {}", e);
+                error!("MQTT error: {}", e);
+                warn!("Waiting {}ms before retrying", config.update_interval_ms);
                 // Wait a bit before retrying
                 time::sleep(Duration::from_millis(config.update_interval_ms)).await;
             }
@@ -158,14 +175,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn execute_command(command: &str) -> Result<String, Box<dyn std::error::Error>> {
+    debug!("Executing command: {}", command);
     let output = Command::new("sh")
         .arg("-c")
         .arg(command)
         .output()?;
     
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        debug!("Command output: {}", result);
+        Ok(result)
     } else {
-        Err(format!("Command failed with exit code: {:?}", output.status.code()).into())
+        let error_msg = format!("Command failed with exit code: {:?}", output.status.code());
+        debug!("Command stderr: {}", String::from_utf8_lossy(&output.stderr));
+        Err(error_msg.into())
     }
 }

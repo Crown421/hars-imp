@@ -111,5 +111,6 @@ WantedBy=multi-user.target
 - `tokio` - Async runtime
 - `serde` - Serialization framework
 - `toml` - TOML parser
-- `chrono` - Date and time handling
 - `serde_json` - JSON serialization for Home Assistant discovery
+- `tracing` - Structured logging
+- `tracing-subscriber` - Logging output formatting and filtering
