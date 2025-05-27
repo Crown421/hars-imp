@@ -1,7 +1,61 @@
 use rumqttc::{AsyncClient, QoS};
 use serde::Serialize;
-use tracing::{debug, info};
+use std::collections::HashMap;
+use tracing::{debug, info, warn};
+use tokio::time::{timeout, Duration};
 use crate::config::Config;
+use crate::system_monitor::SYSTEM_METRICS;
+
+#[derive(Serialize)]
+struct StateData {
+    state: String,
+}
+
+pub struct StateManager {
+    hostname: String,
+    client: AsyncClient,
+}
+
+impl StateManager {
+    pub fn new(hostname: String, client: AsyncClient) -> Self {
+        Self { hostname, client }
+    }
+
+    pub async fn publish_state(&self, state: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let state_data = StateData { 
+            state: state.to_string() 
+        };
+        let state_json = serde_json::to_string(&state_data)?;
+        let state_topic = format!("homeassistant/sensor/{}/state/state", self.hostname);
+        
+        info!("Publishing state: {}", state);
+        
+        // Add timeout to prevent hanging
+        match timeout(Duration::from_secs(5), 
+                     self.client.publish(&state_topic, QoS::AtMostOnce, false, state_json)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!("Timeout publishing state '{}' to topic '{}'", state, state_topic);
+                return Err("Timeout publishing state".into());
+            }
+        }
+        
+        debug!("Successfully published state: {}", state);
+        Ok(())
+    }
+
+    pub async fn publish_on(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.publish_state("On").await
+    }
+
+    pub async fn publish_off(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.publish_state("Off").await
+    }
+
+    pub async fn publish_suspended(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.publish_state("Suspended").await
+    }
+}
 
 #[derive(Serialize)]
 pub struct HomeAssistantDiscovery {
@@ -18,43 +72,54 @@ pub struct HomeAssistantSensorDiscovery {
     pub unique_id: String,
     pub device_class: Option<String>,
     pub unit_of_measurement: Option<String>,
-    pub value_template: Option<String>,
+    pub value_template: String,
     pub device: HomeAssistantDevice,
+}
+
+#[derive(Serialize)]
+pub struct HomeAssistantDeviceDiscovery {
+    #[serde(rename = "dev")]
+    pub device: HomeAssistantDevice,
+    #[serde(rename = "o")]
+    pub origin: HomeAssistantOrigin,
+    #[serde(rename = "cmps")]
+    pub components: HashMap<String, HomeAssistantComponent>,
+    pub state_topic: String,
+}
+
+#[derive(Serialize)]
+pub struct HomeAssistantComponent {
+    pub name: String,
+    #[serde(rename = "p")]
+    pub platform: String,
+    #[serde(rename = "device_class", skip_serializing_if = "Option::is_none")]
+    pub device_class: Option<String>,
+    #[serde(rename = "unit_of_measurement", skip_serializing_if = "Option::is_none")]
+    pub unit_of_measurement: Option<String>,
+    pub value_template: String,
+    pub unique_id: String,
+}
+
+#[derive(Serialize)]
+pub struct HomeAssistantOrigin {
+    pub name: String,
+    #[serde(rename = "sw")]
+    pub sw_version: String,
+    #[serde(rename = "url")]
+    pub support_url: String,
 }
 
 #[derive(Serialize, Clone)]
 pub struct HomeAssistantDevice {
-    pub identifiers: Vec<String>,
+    #[serde(rename = "ids")]
+    pub identifiers: String,
     pub name: String,
+    #[serde(rename = "mdl")]
     pub model: String,
+    #[serde(rename = "mf")]
     pub manufacturer: String,
-}
-
-#[derive(Debug, Clone)]
-struct SensorConfig {
-    pub name: &'static str,
-    pub sensor_type: &'static str,
-    pub device_class: Option<&'static str>,
-    pub unit_of_measurement: Option<&'static str>,
-    pub value_template: &'static str,
-}
-
-impl SensorConfig {
-    const fn new(
-        name: &'static str,
-        sensor_type: &'static str,
-        device_class: Option<&'static str>,
-        unit_of_measurement: Option<&'static str>,
-        value_template: &'static str,
-    ) -> Self {
-        Self {
-            name,
-            sensor_type,
-            device_class,
-            unit_of_measurement,
-            value_template,
-        }
-    }
+    #[serde(rename = "sw")]
+    pub sw_version: String,
 }
 
 pub async fn setup_button_discovery(
@@ -77,10 +142,11 @@ pub async fn setup_button_discovery(
                 command_topic: button_topic.clone(),
                 unique_id: format!("{}_{}", config.hostname, button.name.replace(" ", "_").to_lowercase()),
                 device: HomeAssistantDevice {
-                    identifiers: vec![config.hostname.clone()],
+                    identifiers: config.hostname.clone(),
                     name: config.hostname.clone(),
                     model: "MQTT Daemon".to_string(),
                     manufacturer: "Custom".to_string(),
+                    sw_version: "1.0.0".to_string(),
                 },
             };
             
@@ -107,74 +173,51 @@ pub async fn setup_sensor_discovery(
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let device = HomeAssistantDevice {
-        identifiers: vec![config.hostname.clone()],
+        identifiers: config.hostname.clone(),
         name: config.hostname.clone(),
         model: "MQTT Daemon".to_string(),
         manufacturer: "Custom".to_string(),
+        sw_version: "1.0.0".to_string(),
     };
 
-    // Helper function to create sensor discovery config
-    let create_sensor = |sensor_config: &SensorConfig| -> HomeAssistantSensorDiscovery {
-        HomeAssistantSensorDiscovery {
-            name: format!("{} {}", config.hostname, sensor_config.name),
-            state_topic: format!("homeassistant/sensor/{}/{}/state", config.hostname, sensor_config.sensor_type),
-            unique_id: format!("{}_{}", config.hostname, sensor_config.sensor_type),
-            device_class: sensor_config.device_class.map(|s| s.to_string()),
-            unit_of_measurement: sensor_config.unit_of_measurement.map(|s| s.to_string()),
-            value_template: Some(sensor_config.value_template.to_string()),
-            device: device.clone(),
-        }
+    let origin = HomeAssistantOrigin {
+        name: "MQTT Agent".to_string(),
+        sw_version: "1.0.0".to_string(),
+        support_url: "https://github.com/your-repo/mqtt-agent".to_string(),
     };
 
-    // Define sensor configurations using structured approach
-    const SENSOR_CONFIGS: &[SensorConfig] = &[
-        SensorConfig::new(
-            "CPU Load",
-            "cpu_load",
-            None,
-            Some("%"),
-            "{{ value_json.load }}"
-        ),
-        SensorConfig::new(
-            "CPU Frequency",
-            "cpu_frequency",
-            None,
-            Some("GHz"),
-            "{{ value_json.frequency }}"
-        ),
-        SensorConfig::new(
-            "Memory Total",
-            "memory_total",
-            Some("data_size"),
-            Some("GB"),
-            "{{ value_json.total }}"
-        ),
-        SensorConfig::new(
-            "Memory Free",
-            "memory_free",
-            Some("data_size"),
-            Some("GB"),
-            "{{ value_json.free }}"
-        ),
-        SensorConfig::new(
-            "Memory Free %",
-            "memory_free_pct",
-            None,
-            Some("%"),
-            "{{ value_json.free_percentage }}"
-        ),
-    ];
-
-    // Create and publish sensor discoveries
-    for sensor_config in SENSOR_CONFIGS {
-        let sensor_discovery = create_sensor(sensor_config);
-        let discovery_topic = format!("homeassistant/sensor/{}/{}/config", config.hostname, sensor_config.sensor_type);
-        
-        let discovery_json = serde_json::to_string(&sensor_discovery)?;
-        info!("Publishing sensor discovery for '{}' to: {}", sensor_config.name, discovery_topic);
-        debug!("Sensor discovery payload: {}", discovery_json);
-        client.publish(&discovery_topic, QoS::AtLeastOnce, true, discovery_json).await?;
+    // Create sensor components from system metrics configuration
+    let mut components = HashMap::new();
+    let state_topic = format!("homeassistant/sensor/{}/system_performance/state", config.hostname);
+    
+    for metric in SYSTEM_METRICS {
+        let component_id = format!("{}_{}", config.hostname, metric.json_field);
+        let component = HomeAssistantComponent {
+            name: format!("{} {}", config.hostname, metric.name),
+            platform: "sensor".to_string(),
+            device_class: metric.device_class.map(|s| s.to_string()),
+            unit_of_measurement: metric.unit.map(|s| s.to_string()),
+            value_template: format!("{{{{ value_json.{} }}}}", metric.json_field),
+            unique_id: component_id.clone(),
+        };
+        components.insert(component_id, component);
     }
+
+    // Create device discovery payload
+    let device_discovery = HomeAssistantDeviceDiscovery {
+        device: device.clone(),
+        origin,
+        components,
+        state_topic,
+    };
+
+    // Publish single device discovery message
+    let discovery_topic = format!("homeassistant/device/{}/config", config.hostname);
+    let discovery_json = serde_json::to_string(&device_discovery)?;
+    
+    info!("Publishing device discovery for '{}' to: {}", config.hostname, discovery_topic);
+    info!("Device discovery payload: {}", discovery_json);
+    client.publish(&discovery_topic, QoS::AtLeastOnce, true, discovery_json).await?;
 
     Ok(())
 }

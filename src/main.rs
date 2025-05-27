@@ -12,7 +12,7 @@ pub mod system_monitor;
 
 use config::Config;
 use commands::handle_button_press;
-use discovery::{setup_button_discovery, setup_sensor_discovery};
+use discovery::{setup_button_discovery, setup_sensor_discovery, StateManager};
 use logging::init_tracing;
 use system_monitor::SystemMonitor;
 
@@ -34,21 +34,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     mqttoptions.set_keep_alive(Duration::from_secs(5));
     
     // Create MQTT client
+    debug!("Creating MQTT client");
     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
+    debug!("MQTT client created successfully");
     
     // Subscribe to regular topics
     for topic in &config.topics {
         info!("Subscribing to topic: {}", topic);
         client.subscribe(topic, QoS::AtMostOnce).await?;
     }
+    debug!("Subscribed to all regular topics");
     
     // Handle button discovery and subscription
+    debug!("Setting up button discovery");
     let button_topics = setup_button_discovery(&client, &config).await?;
+    debug!("Button discovery completed");
     
     // Setup sensor discovery for system monitoring
+    debug!("Setting up sensor discovery");
     setup_sensor_discovery(&client, &config).await?;
+    debug!("Sensor discovery completed");
+    
+    // Create state manager and publish initial state
+    // debug!("Creating state manager");
+    // let state_manager = StateManager::new(config.hostname.clone(), client.clone());
+    // debug!("Publishing initial 'On' state");
+    // if let Err(e) = state_manager.publish_on().await {
+    //     warn!("Failed to publish initial state: {}", e);
+    // } else {
+    //     debug!("Successfully published initial state");
+    // }
     
     // Create system monitor
+    info!("Starting system monitor");
     let mut system_monitor = SystemMonitor::new(config.hostname.clone(), client.clone());
     
     // Start system monitoring in background
@@ -93,11 +111,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = signal::ctrl_c() => {
                 info!("Ctrl-C received, shutting down gracefully.");
+                // Publish "Off" state before shutting down
+                // if let Err(e) = state_manager.publish_off().await {
+                //     error!("Failed to publish off state: {}", e);
+                // }
                 break;
             }
         }
     }
 
+    // // Ensure we publish "Off" state before exiting
+    // if let Err(e) = state_manager.publish_off().await {
+    //     error!("Failed to publish final off state: {}", e);
+    // }
+    
     info!("MQTT daemon shut down.");
     Ok(())
 }
