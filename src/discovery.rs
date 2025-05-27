@@ -30,6 +30,33 @@ pub struct HomeAssistantDevice {
     pub manufacturer: String,
 }
 
+#[derive(Debug, Clone)]
+struct SensorConfig {
+    pub name: &'static str,
+    pub sensor_type: &'static str,
+    pub device_class: Option<&'static str>,
+    pub unit_of_measurement: Option<&'static str>,
+    pub value_template: &'static str,
+}
+
+impl SensorConfig {
+    const fn new(
+        name: &'static str,
+        sensor_type: &'static str,
+        device_class: Option<&'static str>,
+        unit_of_measurement: Option<&'static str>,
+        value_template: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            sensor_type,
+            device_class,
+            unit_of_measurement,
+            value_template,
+        }
+    }
+}
+
 pub async fn setup_button_discovery(
     client: &AsyncClient,
     config: &Config,
@@ -86,75 +113,67 @@ pub async fn setup_sensor_discovery(
         manufacturer: "Custom".to_string(),
     };
 
-    // CPU Load sensor
-    let cpu_load_discovery = HomeAssistantSensorDiscovery {
-        name: format!("{} CPU Load", config.hostname),
-        state_topic: format!("homeassistant/sensor/{}/cpu_load/state", config.hostname),
-        unique_id: format!("{}_cpu_load", config.hostname),
-        device_class: None,
-        unit_of_measurement: Some("%".to_string()),
-        value_template: Some("{{ value_json.load }}".to_string()),
-        device: device.clone(),
+    // Helper function to create sensor discovery config
+    let create_sensor = |sensor_config: &SensorConfig| -> HomeAssistantSensorDiscovery {
+        HomeAssistantSensorDiscovery {
+            name: format!("{} {}", config.hostname, sensor_config.name),
+            state_topic: format!("homeassistant/sensor/{}/{}/state", config.hostname, sensor_config.sensor_type),
+            unique_id: format!("{}_{}", config.hostname, sensor_config.sensor_type),
+            device_class: sensor_config.device_class.map(|s| s.to_string()),
+            unit_of_measurement: sensor_config.unit_of_measurement.map(|s| s.to_string()),
+            value_template: Some(sensor_config.value_template.to_string()),
+            device: device.clone(),
+        }
     };
 
-    // CPU Frequency sensor
-    let cpu_freq_discovery = HomeAssistantSensorDiscovery {
-        name: format!("{} CPU Frequency", config.hostname),
-        state_topic: format!("homeassistant/sensor/{}/cpu_frequency/state", config.hostname),
-        unique_id: format!("{}_cpu_frequency", config.hostname),
-        device_class: None,
-        unit_of_measurement: Some("MHz".to_string()),
-        value_template: Some("{{ value_json.frequency }}".to_string()),
-        device: device.clone(),
-    };
-
-    // Memory Total sensor
-    let memory_total_discovery = HomeAssistantSensorDiscovery {
-        name: format!("{} Memory Total", config.hostname),
-        state_topic: format!("homeassistant/sensor/{}/memory_total/state", config.hostname),
-        unique_id: format!("{}_memory_total", config.hostname),
-        device_class: Some("data_size".to_string()),
-        unit_of_measurement: Some("GB".to_string()),
-        value_template: Some("{{ value_json.total }}".to_string()),
-        device: device.clone(),
-    };
-
-    // Memory Free sensor
-    let memory_free_discovery = HomeAssistantSensorDiscovery {
-        name: format!("{} Memory Free", config.hostname),
-        state_topic: format!("homeassistant/sensor/{}/memory_free/state", config.hostname),
-        unique_id: format!("{}_memory_free", config.hostname),
-        device_class: Some("data_size".to_string()),
-        unit_of_measurement: Some("GB".to_string()),
-        value_template: Some("{{ value_json.free }}".to_string()),
-        device: device.clone(),
-    };
-
-    // Memory Free Percentage sensor
-    let memory_free_pct_discovery = HomeAssistantSensorDiscovery {
-        name: format!("{} Memory Free %", config.hostname),
-        state_topic: format!("homeassistant/sensor/{}/memory_free_pct/state", config.hostname),
-        unique_id: format!("{}_memory_free_pct", config.hostname),
-        device_class: None,
-        unit_of_measurement: Some("%".to_string()),
-        value_template: Some("{{ value_json.free_percentage }}".to_string()),
-        device: device,
-    };
-
-    // Publish all sensor discoveries
-    let sensors = vec![
-        (cpu_load_discovery, format!("homeassistant/sensor/{}/cpu_load/config", config.hostname)),
-        (cpu_freq_discovery, format!("homeassistant/sensor/{}/cpu_frequency/config", config.hostname)),
-        (memory_total_discovery, format!("homeassistant/sensor/{}/memory_total/config", config.hostname)),
-        (memory_free_discovery, format!("homeassistant/sensor/{}/memory_free/config", config.hostname)),
-        (memory_free_pct_discovery, format!("homeassistant/sensor/{}/memory_free_pct/config", config.hostname)),
+    // Define sensor configurations using structured approach
+    const SENSOR_CONFIGS: &[SensorConfig] = &[
+        SensorConfig::new(
+            "CPU Load",
+            "cpu_load",
+            None,
+            Some("%"),
+            "{{ value_json.load }}"
+        ),
+        SensorConfig::new(
+            "CPU Frequency",
+            "cpu_frequency",
+            None,
+            Some("GHz"),
+            "{{ value_json.frequency }}"
+        ),
+        SensorConfig::new(
+            "Memory Total",
+            "memory_total",
+            Some("data_size"),
+            Some("GB"),
+            "{{ value_json.total }}"
+        ),
+        SensorConfig::new(
+            "Memory Free",
+            "memory_free",
+            Some("data_size"),
+            Some("GB"),
+            "{{ value_json.free }}"
+        ),
+        SensorConfig::new(
+            "Memory Free %",
+            "memory_free_pct",
+            None,
+            Some("%"),
+            "{{ value_json.free_percentage }}"
+        ),
     ];
 
-    for (sensor, topic) in sensors {
-        let discovery_json = serde_json::to_string(&sensor)?;
-        info!("Publishing sensor discovery to: {}", topic);
+    // Create and publish sensor discoveries
+    for sensor_config in SENSOR_CONFIGS {
+        let sensor_discovery = create_sensor(sensor_config);
+        let discovery_topic = format!("homeassistant/sensor/{}/{}/config", config.hostname, sensor_config.sensor_type);
+        
+        let discovery_json = serde_json::to_string(&sensor_discovery)?;
+        info!("Publishing sensor discovery for '{}' to: {}", sensor_config.name, discovery_topic);
         debug!("Sensor discovery payload: {}", discovery_json);
-        client.publish(&topic, QoS::AtLeastOnce, true, discovery_json).await?;
+        client.publish(&discovery_topic, QoS::AtLeastOnce, true, discovery_json).await?;
     }
 
     Ok(())

@@ -11,7 +11,7 @@ struct CpuLoadData {
 
 #[derive(Serialize)]
 struct CpuFrequencyData {
-    frequency: u64,
+    frequency: f32,
 }
 
 #[derive(Serialize)]
@@ -77,27 +77,29 @@ impl SystemMonitor {
         // Refresh CPU information
         self.system.refresh_cpu();
         
-        // Get load average (1 minute) - use static method
+        // Get load average (1 minute) and normalize by CPU count
         let load_avg = System::load_average();
-        let cpu_load = (load_avg.one * 100.0) as f32;
+        let cpu_count = self.system.cpus().len() as f64;
+        let cpu_load = (load_avg.one / cpu_count * 100.0) as f32;
         
         // Publish CPU load
         let cpu_load_data = CpuLoadData { load: cpu_load };
         let cpu_load_json = serde_json::to_string(&cpu_load_data)?;
         let cpu_load_topic = format!("homeassistant/sensor/{}/cpu_load/state", self.hostname);
         
-        info!("Publishing CPU load: {:.2}%", cpu_load);
+        info!("Publishing CPU load: {:.2}% (load avg: {:.2}, cores: {})", cpu_load, load_avg.one, cpu_count);
         self.client.publish(&cpu_load_topic, QoS::AtMostOnce, false, cpu_load_json).await?;
         
-        // Get CPU frequency (if available)
+        // Get CPU frequency (if available) and convert to GHz
         if let Some(cpu) = self.system.cpus().first() {
-            let frequency = cpu.frequency();
-            if frequency > 0 {
-                let cpu_freq_data = CpuFrequencyData { frequency };
+            let frequency_mhz = cpu.frequency();
+            if frequency_mhz > 0 {
+                let frequency_ghz = frequency_mhz as f32 / 1000.0;
+                let cpu_freq_data = CpuFrequencyData { frequency: frequency_ghz };
                 let cpu_freq_json = serde_json::to_string(&cpu_freq_data)?;
                 let cpu_freq_topic = format!("homeassistant/sensor/{}/cpu_frequency/state", self.hostname);
                 
-                info!("Publishing CPU frequency: {} MHz", frequency);
+                info!("Publishing CPU frequency: {:.2} GHz", frequency_ghz);
                 self.client.publish(&cpu_freq_topic, QoS::AtMostOnce, false, cpu_freq_json).await?;
             } else {
                 debug!("CPU frequency information not available");
