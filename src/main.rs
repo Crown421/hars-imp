@@ -1,7 +1,7 @@
 use rumqttc::{MqttOptions, AsyncClient, QoS, Event, Packet};
 use std::time::Duration;
 use tokio::time;
-use tokio::signal; // Add this line
+use tokio::signal;
 use tracing::{info, warn, error, debug, trace};
 
 pub mod config;
@@ -11,6 +11,7 @@ pub mod logging;
 pub mod status;
 pub mod system_monitor;
 pub mod version;
+pub mod dbus;
 
 use config::Config;
 use commands::handle_button_press;
@@ -18,19 +19,9 @@ use discovery::{setup_button_discovery, setup_sensor_discovery, setup_status_dis
 use logging::init_tracing;
 use status::StatusManager;
 use system_monitor::SystemMonitor;
+use dbus::{PowerMonitor, PowerEvent}; 
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load configuration
-    let config = Config::load_from_file("config.toml")?;
-    
-    // Initialize tracing with the configured log level
-    init_tracing(&config.log_level)?;
-    
-    info!("Starting MQTT daemon for hostname: {}", config.hostname);
-    info!("Connecting to MQTT broker: {}:{}", config.mqtt_url, config.mqtt_port);
-    debug!("Log level set to: {}", config.log_level);
-    
+async fn initialize_mqtt_connection(config: &Config) -> Result<(AsyncClient, rumqttc::EventLoop, Vec<(String, String)>, StatusManager, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
     // Set up MQTT options
     let mut mqttoptions = MqttOptions::new(&config.hostname, &config.mqtt_url, config.mqtt_port);
     mqttoptions.set_credentials(&config.username, &config.password);
@@ -38,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Create MQTT client
     debug!("Creating MQTT client");
-    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
+    let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
     debug!("MQTT client created successfully");
     
     // Subscribe to regular topics
@@ -78,9 +69,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut system_monitor = SystemMonitor::new(config.hostname.clone(), client.clone());
     
     // Start system monitoring in background
-    let _monitoring_handle = tokio::spawn(async move {
+    let monitoring_handle = tokio::spawn(async move {
         system_monitor.run_monitoring_loop().await;
     });
+    
+    Ok((client, eventloop, button_topics, status_manager, monitoring_handle))
+} 
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load configuration
+    let config = Config::load_from_file("config.toml")?;
+    
+    // Initialize tracing with the configured log level
+    init_tracing(&config.log_level)?;
+    
+    info!("Starting MQTT daemon for hostname: {}", config.hostname);
+    info!("Connecting to MQTT broker: {}:{}", config.mqtt_url, config.mqtt_port);
+    debug!("Log level set to: {}", config.log_level);
+
+    // Set up power monitor
+    let power_monitor = PowerMonitor::new();
+    let mut power_event_rx = power_monitor.subscribe();
+    
+    // Clone power monitor for the background task
+    let mut power_monitor_bg = PowerMonitor::new();
+    
+    // Start power monitor in background
+    let _power_monitor_handle = tokio::spawn(async move {
+        if let Err(e) = power_monitor_bg.run().await {
+            warn!("Power monitor encountered an error: {}", e);
+            warn!("Power monitoring functionality will be unavailable.");
+        }
+    });
+    
+    // Initialize MQTT connection
+    let (mut client, mut eventloop, mut button_topics, mut status_manager, mut system_monitor_handle) = 
+        initialize_mqtt_connection(&config).await?;
     
     // Main event loop
     info!("Starting main event loop");
@@ -114,6 +139,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         warn!("Waiting {}ms before retrying", config.update_interval_ms);
                         // Wait a bit before retrying
                         time::sleep(Duration::from_millis(config.update_interval_ms)).await;
+                    }
+                }
+            }
+            result = power_event_rx.recv() => {
+                match result {
+                    Ok(PowerEvent::Suspending) => {
+                        info!("System is about to suspend, performing shutdown actions...");
+                        
+                        // Create a suspend inhibitor to delay suspension
+                        let _inhibitor = match power_monitor.create_inhibitor("Saving MQTT state before suspend").await {
+                            Ok(inhibitor) => {
+                                debug!("Created suspend inhibitor, delaying system suspend");
+                                Some(inhibitor)
+                            }
+                            Err(e) => {
+                                warn!("Failed to create suspend inhibitor: {}", e);
+                                None
+                            }
+                        };
+                        
+                        // Perform critical shutdown actions
+                        if let Err(e) = status_manager.publish_suspended().await {
+                            error!("Failed to publish suspend status: {}", e);
+                        } else {
+                            debug!("Successfully published 'Suspended' status before suspend");
+                        }
+                        
+                        // Stop system monitoring
+                        system_monitor_handle.abort();
+                        debug!("Stopped system monitoring");
+                        
+                        // Gracefully disconnect MQTT client
+                        info!("Disconnecting MQTT client before suspend");
+                        client.disconnect().await.unwrap_or_else(|e| {
+                            warn!("Error during MQTT disconnect: {}", e);
+                        });
+                        debug!("MQTT client disconnected");
+                        
+                        // The inhibitor will be automatically released when it goes out of scope
+                        debug!("Pre-suspend actions completed, allowing system to suspend");
+                    }
+                    Ok(PowerEvent::Resuming) => {
+                        info!("System resumed from suspend, re-establishing connections...");
+                        
+                        // Re-initialize MQTT connection
+                        info!("Re-initializing MQTT connection after resume");
+                        match initialize_mqtt_connection(&config).await {
+                            Ok((new_client, new_eventloop, new_button_topics, new_status_manager, new_monitoring_handle)) => {
+                                client = new_client;
+                                eventloop = new_eventloop;
+                                button_topics = new_button_topics;
+                                status_manager = new_status_manager;
+                                system_monitor_handle = new_monitoring_handle;
+                                
+                                info!("MQTT connection re-established successfully");
+                                debug!("Successfully published 'On' status after resume");
+                            }
+                            Err(e) => {
+                                error!("Failed to re-establish MQTT connection after resume: {}", e);
+                                // Continue with the old connection and hope it recovers
+                            }
+                        }
+                        
+                        // Add any other post-resume actions here
+                    }
+                    Err(e) => {
+                        error!("Error receiving power event: {}", e);
                     }
                 }
             }
