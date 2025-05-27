@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod logging;
 pub mod status;
 pub mod system_monitor;
+pub mod version;
 
 use config::Config;
 use commands::handle_button_press;

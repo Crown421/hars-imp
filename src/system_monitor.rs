@@ -100,13 +100,13 @@ impl SystemMonitor {
         let free_memory_gb = free_memory as f32 / 1024.0 / 1024.0 / 1024.0;
         let free_percentage = (free_memory as f32 / total_memory as f32) * 100.0;
         
-        // Create combined performance data
+        // Create combined performance data with values rounded to 2 decimal places
         let performance_data = SystemPerformanceData {
-            cpu_load,
-            cpu_frequency,
-            memory_total: total_memory_gb,
-            memory_free: free_memory_gb,
-            memory_free_percentage: free_percentage,
+            cpu_load: (cpu_load * 100.0).round() / 100.0,
+            cpu_frequency: cpu_frequency.map(|f| (f * 100.0).round() / 100.0),
+            memory_total: (total_memory_gb * 100.0).round() / 100.0,
+            memory_free: (free_memory_gb * 100.0).round() / 100.0,
+            memory_free_percentage: (free_percentage * 100.0).round() / 100.0,
         };
         
         // Publish to single topic

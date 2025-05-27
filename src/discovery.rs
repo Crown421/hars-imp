@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use tracing::{debug, info};
 use crate::config::Config;
 use crate::system_monitor::SYSTEM_METRICS;
+use crate::version::VersionInfo;
 
 /// Generic function to publish Home Assistant discovery messages
 pub async fn publish_discovery<T: Serialize>(
@@ -89,12 +90,13 @@ pub struct HomeAssistantDevice {
 /// Creates a shared HomeAssistant device object using the hostname from config
 /// and the version from Cargo.toml at compile time
 fn create_shared_device(config: &Config) -> HomeAssistantDevice {
+    let version_info = VersionInfo::get();
     HomeAssistantDevice {
         identifiers: config.hostname.clone(),
         name: config.hostname.clone(),
         model: "MQTT Daemon".to_string(),
         manufacturer: "Custom".to_string(),
-        sw_version: env!("CARGO_PKG_VERSION").to_string(),
+        sw_version: version_info.version.clone(),
     }
 }
 
@@ -141,10 +143,11 @@ pub async fn setup_sensor_discovery(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let device = create_shared_device(config);
 
+    let version_info = VersionInfo::get();
     let origin = HomeAssistantOrigin {
         name: "MQTT Agent".to_string(),
-        sw_version: env!("CARGO_PKG_VERSION").to_string(),
-        support_url: "https://github.com/your-repo/mqtt-agent".to_string(),
+        sw_version: version_info.version.clone(),
+        support_url: version_info.repository.clone(),
     };
 
     // Create sensor components from system metrics configuration
