@@ -135,20 +135,24 @@ impl PowerManager {
     }
 
     pub(crate) async fn run_monitor(&mut self) -> Result<()> {
-        // Try to connect to the system D-Bus
-        let connection = match Connection::system().await {
-            Ok(conn) => {
-                info!("Successfully connected to system D-Bus for monitoring");
-                self.connection = Some(conn.clone());
-                conn
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to connect to system D-Bus: {}. Power monitoring will be disabled.",
-                    e
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
-                return Ok(());
+        // Use the existing connection if available, otherwise try to connect
+        let connection = if let Some(conn) = &self.connection {
+            conn.clone()
+        } else {
+            match Connection::system().await {
+                Ok(conn) => {
+                    debug!("Successfully connected to system D-Bus for monitoring");
+                    self.connection = Some(conn.clone());
+                    conn
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to system D-Bus: {}. Power monitoring will be disabled.",
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
+                    return Ok(());
+                }
             }
         };
 

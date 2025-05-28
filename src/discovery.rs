@@ -1,8 +1,8 @@
+use crate::utils::{Config, VersionInfo};
 use rumqttc::{AsyncClient, QoS};
 use serde::Serialize;
 use std::collections::HashMap;
 use tracing::{debug, info};
-use crate::utils::{Config, VersionInfo};
 
 /// Generic function to publish Home Assistant discovery messages
 pub async fn publish_discovery<T: Serialize>(
@@ -12,11 +12,13 @@ pub async fn publish_discovery<T: Serialize>(
     retain: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let discovery_json = serde_json::to_string(discovery_payload)?;
-    
-    info!("Publishing discovery to: {}", discovery_topic);
+
+    debug!("Publishing discovery to: {}", discovery_topic);
     debug!("Discovery payload: {}", discovery_json);
-    client.publish(discovery_topic, QoS::AtLeastOnce, retain, discovery_json).await?;
-    
+    client
+        .publish(discovery_topic, QoS::AtLeastOnce, retain, discovery_json)
+        .await?;
+
     Ok(())
 }
 
@@ -57,7 +59,10 @@ pub struct HomeAssistantComponent {
     pub platform: String,
     #[serde(rename = "device_class", skip_serializing_if = "Option::is_none")]
     pub device_class: Option<String>,
-    #[serde(rename = "unit_of_measurement", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "unit_of_measurement",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub unit_of_measurement: Option<String>,
     pub value_template: String,
     pub unique_id: String,
@@ -97,5 +102,3 @@ pub fn create_shared_device(config: &Config) -> HomeAssistantDevice {
         sw_version: version_info.version.clone(),
     }
 }
-
-

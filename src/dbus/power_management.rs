@@ -5,6 +5,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use super::inhibitor::PowerManager;
+use crate::shutdown::{perform_graceful_mqtt_shutdown, ShutdownScenario};
 use crate::status::StatusManager;
 use crate::Config;
 
@@ -20,44 +21,55 @@ pub enum PowerEvent {
 pub async fn setup_power_monitoring() -> (PowerManager, tokio::task::JoinHandle<()>) {
     let mut power_manager = PowerManager::new();
 
-    // Create a separate instance for the background monitoring task
-    let mut monitor_instance = PowerManager::new_with_sender(power_manager.clone_sender());
+    // Establish D-Bus connection once for both monitoring and inhibitors
+    if let Err(e) = power_manager.connect_dbus().await {
+        warn!("Failed to connect to D-Bus: {}", e);
+        warn!("Power monitoring and inhibitors will be unavailable.");
 
-    // Start power monitoring in background
+        // Create a dummy monitoring task that just waits indefinitely
+        let monitor_handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
+        });
+
+        return (power_manager, monitor_handle);
+    }
+
+    // Create inhibitors using the established connection
+    // Create suspend inhibitor
+    if let Err(e) = power_manager
+        .create_suspend_inhibitor("MQTT daemon startup - preventing unexpected suspension")
+        .await
+    {
+        warn!("Failed to create suspend inhibitor: {}", e);
+    } else {
+        info!("Created suspend inhibitor (delay mode with system default timeout)");
+    }
+
+    // Create shutdown inhibitor
+    if let Err(e) = power_manager
+        .create_shutdown_inhibitor("MQTT daemon graceful shutdown - allowing cleanup time")
+        .await
+    {
+        warn!("Failed to create shutdown inhibitor: {}", e);
+    } else {
+        info!("Created shutdown inhibitor (delay mode with system default timeout)");
+    }
+
+    // Get the sender for creating a new PowerManager for the main loop
+    let event_sender = power_manager.clone_sender();
+
+    // Start power monitoring using the same PowerManager instance
     let monitor_handle = tokio::spawn(async move {
-        if let Err(e) = monitor_instance.run_monitor().await {
+        if let Err(e) = power_manager.run_monitor().await {
             warn!("Power monitor encountered an error: {}", e);
             warn!("Power monitoring functionality will be unavailable.");
         }
     });
 
-    // Try to create inhibitors on the main power manager instance
-    // We need to establish a D-Bus connection first
-    if let Err(e) = power_manager.connect_dbus().await {
-        warn!("Failed to connect to D-Bus for inhibitors: {}", e);
-    } else {
-        // Create suspend inhibitor
-        if let Err(e) = power_manager
-            .create_suspend_inhibitor("MQTT daemon startup - preventing unexpected suspension")
-            .await
-        {
-            warn!("Failed to create suspend inhibitor: {}", e);
-        } else {
-            info!("Created suspend inhibitor (delay mode with system default timeout)");
-        }
+    // Create a new PowerManager for the main loop (with shared sender)
+    let main_power_manager = PowerManager::new_with_sender(event_sender);
 
-        // Create shutdown inhibitor
-        if let Err(e) = power_manager
-            .create_shutdown_inhibitor("MQTT daemon graceful shutdown - allowing cleanup time")
-            .await
-        {
-            warn!("Failed to create shutdown inhibitor: {}", e);
-        } else {
-            info!("Created shutdown inhibitor (delay mode with system default timeout)");
-        }
-    }
-
-    (power_manager, monitor_handle)
+    (main_power_manager, monitor_handle)
 }
 
 /// Function to handle power events in the main tokio select loop
@@ -129,30 +141,23 @@ impl<'a> PowerEventHandler<'a> {
         // We already have an inhibitor from startup, so we can proceed with shutdown actions
         // The existing inhibitor gives us up to 2 seconds to complete our work
 
-        // Perform critical shutdown actions
-        if let Err(e) = self.status_manager.publish_suspended().await {
-            error!("Failed to publish suspend status: {}", e);
-        } else {
-            debug!("Successfully published 'Suspended' status before suspend");
-        }
-
         // Stop system monitoring
         self.system_monitor_handle.abort();
         debug!("Stopped system monitoring");
 
-        // Gracefully disconnect MQTT client
-        info!("Disconnecting MQTT client before suspend");
-        match self.client.disconnect().await {
-            Ok(_) => debug!("MQTT client disconnected cleanly"),
-            Err(e) => {
-                if e.to_string().contains("connection closed by peer")
-                    || e.to_string().contains("ConnectionAborted")
-                {
-                    debug!("Expected disconnect behavior during suspend: {}", e);
-                } else {
-                    warn!("Error during MQTT disconnect: {}", e);
-                }
-            }
+        // Use the general MQTT shutdown function with proper event queue draining
+        if let Err(e) = perform_graceful_mqtt_shutdown(
+            self.status_manager,
+            self.client,
+            self.eventloop,
+            ShutdownScenario::Suspend,
+        )
+        .await
+        {
+            error!(
+                "Failed to perform graceful MQTT shutdown for suspend: {}",
+                e
+            );
         }
 
         // Release the inhibitor to allow the system to suspend
