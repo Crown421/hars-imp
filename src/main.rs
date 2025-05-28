@@ -4,21 +4,17 @@ use tokio::time;
 use tokio::signal;
 use tracing::{info, warn, error, debug, trace};
 
-pub mod config;
+pub mod utils;
 pub mod commands;
 pub mod discovery;
-pub mod logging;
 pub mod status;
 pub mod system_monitor;
-pub mod version;
 pub mod dbus;
 
-use config::Config;
-use commands::handle_button_press;
-use discovery::{setup_button_discovery, setup_sensor_discovery, setup_status_discovery};
-use logging::init_tracing;
-use status::StatusManager;
-use system_monitor::SystemMonitor;
+use utils::{Config, init_tracing};
+use commands::{handle_button_press, setup_button_discovery};
+use status::{StatusManager, setup_status_discovery};
+use system_monitor::{SystemMonitor, setup_sensor_discovery};
 use dbus::{setup_power_monitoring, handle_power_events, handle_suspend_actions, handle_resume_actions, PowerEvent}; 
 
 async fn initialize_mqtt_connection(config: &Config) -> Result<(AsyncClient, rumqttc::EventLoop, Vec<(String, String)>, StatusManager, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
