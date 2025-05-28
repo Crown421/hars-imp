@@ -1,4 +1,4 @@
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet};
 use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, trace, warn};
@@ -39,13 +39,6 @@ async fn initialize_mqtt_connection(
     debug!("Creating MQTT client");
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
     debug!("MQTT client created successfully");
-
-    // Subscribe to regular topics
-    for topic in &config.topics {
-        info!("Subscribing to topic: {}", topic);
-        client.subscribe(topic, QoS::AtMostOnce).await?;
-    }
-    debug!("Subscribed to all regular topics");
 
     // Handle button discovery and subscription
     let button_topics = setup_button_discovery(&client, &config).await?;

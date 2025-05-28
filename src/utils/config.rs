@@ -15,7 +15,6 @@ pub struct Config {
     pub username: String,
     pub password: String,
     pub log_level: String,
-    pub topics: Vec<String>,
     pub update_interval_ms: u64,
     pub button: Option<Vec<Button>>,
     #[serde(skip)]
