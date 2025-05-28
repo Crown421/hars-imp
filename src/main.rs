@@ -1,7 +1,6 @@
 use rumqttc::{MqttOptions, AsyncClient, QoS, Event, Packet};
 use std::time::Duration;
 use tokio::time;
-use tokio::signal;
 use tracing::{info, warn, error, debug, trace};
 
 pub mod utils;
@@ -10,12 +9,14 @@ pub mod discovery;
 pub mod status;
 pub mod system_monitor;
 pub mod dbus;
+pub mod shutdown;
 
 use utils::{Config, init_tracing};
 use commands::{handle_button_press, setup_button_discovery};
 use status::{StatusManager, setup_status_discovery};
 use system_monitor::{SystemMonitor, setup_sensor_discovery};
-use dbus::{setup_power_monitoring, handle_power_events}; 
+use dbus::{setup_power_monitoring, handle_power_events};
+use shutdown::{ShutdownHandler, perform_graceful_shutdown}; 
 
 async fn initialize_mqtt_connection(config: &Config) -> Result<(AsyncClient, rumqttc::EventLoop, Vec<(String, String)>, StatusManager, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
     // Set up MQTT options
@@ -94,6 +95,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut client, mut eventloop, mut button_topics, mut status_manager, mut system_monitor_handle) = 
         initialize_mqtt_connection(&config).await?;
     
+    // Setup shutdown signal handlers
+    let mut shutdown_handler = ShutdownHandler::new()?;
+    
     // Main event loop
     info!("Starting main event loop");
     loop {
@@ -146,33 +150,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     debug!("Power monitoring stopped");
                 }
             }
-            _ = signal::ctrl_c() => {
-                info!("Ctrl-C received, shutting down gracefully.");
-                // Publish "Off" status before shutting down
+            signal = shutdown_handler.wait_for_shutdown_signal() => {
+                info!("{}", signal.description());
+                perform_graceful_shutdown(&mut status_manager, &mut client, &mut eventloop).await?;
                 break;
             }
         }
     }
 
-    // Ensure we publish "Off" status before exiting
-    if let Err(e) = status_manager.publish_off().await {
-        error!("Failed to publish final off status: {}", e);
-    }
-
-    // Process any pending events to ensure message is sent
-    info!("Processing final MQTT events...");
-    for _ in 0..3 {
-        if let Ok(event) = eventloop.poll().await {
-            debug!("Processing shutdown event: {:?}", event);
-        }
-        time::sleep(Duration::from_millis(100)).await;
-    }
-    
-    // Explicitly disconnect the MQTT client
-    info!("Disconnecting from MQTT broker...");
-    if let Err(e) = client.disconnect().await {
-        error!("Error disconnecting from MQTT broker: {}", e);
-    }
     
     info!("MQTT daemon shut down.");
     Ok(())
