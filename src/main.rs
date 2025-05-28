@@ -62,7 +62,7 @@ async fn initialize_mqtt_connection(config: &Config) -> Result<(AsyncClient, rum
     
     // Create system monitor
     info!("Starting system monitor");
-    let mut system_monitor = SystemMonitor::new(config.hostname.clone(), client.clone());
+    let mut system_monitor = SystemMonitor::new(config.sensor_topic_base.clone(), client.clone());
     
     // Start system monitoring in background
     let monitoring_handle = tokio::spawn(async move {

@@ -16,6 +16,40 @@ pub struct SystemPerformanceData {
     pub memory_free_percentage: f32,
 }
 
+impl SystemPerformanceData {
+    // Add this new method
+    pub fn from_system(system: &System) -> Self {
+        // Get CPU metrics
+        let load_avg = System::load_average();
+        let cpu_count = system.cpus().len() as f64;
+        let cpu_load = (load_avg.one / cpu_count * 100.0) as f32;
+        
+        // Get CPU frequency (if available) and convert to GHz
+        let cpu_frequency = system.cpus().first()
+            .map(|cpu| cpu.frequency())
+            .filter(|&freq| freq > 0)
+            .map(|freq| freq as f32 / 1000.0);
+        
+        // Get memory metrics
+        let total_memory = system.total_memory();
+        let free_memory = system.available_memory();
+        
+        // Convert to GB
+        let total_memory_gb = total_memory as f32 / 1024.0 / 1024.0 / 1024.0;
+        let free_memory_gb = free_memory as f32 / 1024.0 / 1024.0 / 1024.0;
+        let free_percentage = (free_memory as f32 / total_memory as f32) * 100.0;
+        
+        // Return performance data with values rounded to 2 decimal places
+        Self {
+            cpu_load: (cpu_load * 100.0).round() / 100.0,
+            cpu_frequency: cpu_frequency.map(|f| (f * 100.0).round() / 100.0),
+            memory_total: (total_memory_gb * 100.0).round() / 100.0,
+            memory_free: (free_memory_gb * 100.0).round() / 100.0,
+            memory_free_percentage: (free_percentage * 100.0).round() / 100.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MetricConfig {
     pub name: &'static str,
@@ -50,18 +84,19 @@ pub const SYSTEM_METRICS: &[MetricConfig] = &[
 
 pub struct SystemMonitor {
     system: System,
-    hostname: String,
+    sensor_topic: String,
     client: AsyncClient,
 }
 
 impl SystemMonitor {
-    pub fn new(hostname: String, client: AsyncClient) -> Self {
+    pub fn new(sensor_topic_base: String, client: AsyncClient) -> Self {
         let mut system = System::new_all();
         system.refresh_all();
+        let sensor_topic = format!("{}/system_performance/state", sensor_topic_base);
         
         Self {
             system,
-            hostname,
+            sensor_topic,
             client,
         }
     }
@@ -83,43 +118,20 @@ impl SystemMonitor {
         // Refresh all system information
         self.system.refresh_all();
         
-        // Get CPU metrics
-        let load_avg = System::load_average();
-        let cpu_count = self.system.cpus().len() as f64;
-        let cpu_load = (load_avg.one / cpu_count * 100.0) as f32;
-        
-        // Get CPU frequency (if available) and convert to GHz
-        let cpu_frequency = self.system.cpus().first()
-            .map(|cpu| cpu.frequency())
-            .filter(|&freq| freq > 0)
-            .map(|freq| freq as f32 / 1000.0);
-        
-        // Get memory metrics
-        let total_memory = self.system.total_memory();
-        let free_memory = self.system.available_memory();
-        
-        // Convert to GB
-        let total_memory_gb = total_memory as f32 / 1024.0 / 1024.0 / 1024.0;
-        let free_memory_gb = free_memory as f32 / 1024.0 / 1024.0 / 1024.0;
-        let free_percentage = (free_memory as f32 / total_memory as f32) * 100.0;
-        
-        // Create combined performance data with values rounded to 2 decimal places
-        let performance_data = SystemPerformanceData {
-            cpu_load: (cpu_load * 100.0).round() / 100.0,
-            cpu_frequency: cpu_frequency.map(|f| (f * 100.0).round() / 100.0),
-            memory_total: (total_memory_gb * 100.0).round() / 100.0,
-            memory_free: (free_memory_gb * 100.0).round() / 100.0,
-            memory_free_percentage: (free_percentage * 100.0).round() / 100.0,
-        };
-        
-        // Publish to single topic
-        let performance_json = serde_json::to_string(&performance_data)?;
-        let performance_topic = format!("homeassistant/sensor/{}/system_performance/state", self.hostname);
+        // Create performance data using the new method
+        let performance_data = SystemPerformanceData::from_system(&self.system);
         
         info!("Publishing system performance - CPU: {:.2}%, Freq: {:?} GHz, Memory: {:.2}/{:.2} GB ({:.1}% free)", 
-              cpu_load, cpu_frequency, free_memory_gb, total_memory_gb, free_percentage);
+            performance_data.cpu_load, 
+            performance_data.cpu_frequency, 
+            performance_data.memory_free, 
+            performance_data.memory_total, 
+            performance_data.memory_free_percentage);
+
+        // Publish to single topic
+        let performance_json = serde_json::to_string(&performance_data)?;
         
-        self.client.publish(&performance_topic, QoS::AtMostOnce, false, performance_json).await?;
+        self.client.publish(&self.sensor_topic, QoS::AtMostOnce, false, performance_json).await?;
         
         Ok(())
     }
@@ -140,7 +152,7 @@ pub async fn setup_sensor_discovery(
 
     // Create sensor components from system metrics configuration
     let mut components = HashMap::new();
-    let state_topic = format!("homeassistant/sensor/{}/system_performance/state", config.hostname);
+    let state_topic = format!("{}/system_performance/state", config.sensor_topic_base);
     
     for metric in SYSTEM_METRICS {
         let component_id = format!("{}_{}", config.hostname, metric.json_field);
@@ -164,10 +176,8 @@ pub async fn setup_sensor_discovery(
     };
 
     // Publish single device discovery message
-    let discovery_topic = format!("homeassistant/device/{}/config", config.hostname);
-    
     info!("Publishing device discovery for '{}'", config.hostname);
-    publish_discovery(client, &discovery_topic, &device_discovery, true).await?;
+    publish_discovery(client, &config.device_discovery_topic, &device_discovery, true).await?;
 
     Ok(())
 }
