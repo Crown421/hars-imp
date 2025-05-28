@@ -152,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             signal = shutdown_handler.wait_for_shutdown_signal() => {
                 info!("{}", signal.description());
-                perform_graceful_shutdown(&mut status_manager, &mut client, &mut eventloop).await?;
+                perform_graceful_shutdown(&mut status_manager, &mut client, &mut eventloop, Some(&mut power_manager)).await?;
                 break;
             }
         }

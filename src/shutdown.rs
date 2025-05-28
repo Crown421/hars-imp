@@ -1,9 +1,10 @@
+use crate::dbus::PowerManager;
+use crate::status::StatusManager;
 use rumqttc::{AsyncClient, EventLoop};
 use std::time::Duration;
-use tokio::time;
 use tokio::signal::unix::{signal, Signal, SignalKind};
-use tracing::{info, error, debug};
-use crate::status::StatusManager;
+use tokio::time;
+use tracing::{debug, error, info};
 
 pub struct ShutdownHandler {
     sigterm: Signal,
@@ -14,11 +15,8 @@ impl ShutdownHandler {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let sigterm = signal(SignalKind::terminate())?;
         let sigint = signal(SignalKind::interrupt())?;
-        
-        Ok(ShutdownHandler {
-            sigterm,
-            sigint,
-        })
+
+        Ok(ShutdownHandler { sigterm, sigint })
     }
 
     pub async fn wait_for_shutdown_signal(&mut self) -> ShutdownSignal {
@@ -48,16 +46,23 @@ pub async fn perform_graceful_shutdown(
     status_manager: &mut StatusManager,
     client: &mut AsyncClient,
     eventloop: &mut EventLoop,
+    power_manager: Option<&mut PowerManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Performing graceful shutdown...");
-    
+
+    // Release shutdown inhibitor first to signal we're handling the shutdown
+    if let Some(pm) = power_manager {
+        pm.release_shutdown_inhibitor();
+        debug!("Released shutdown inhibitor to acknowledge shutdown signal");
+    }
+
     // Publish "Off" status
     if let Err(e) = status_manager.publish_off().await {
         error!("Failed to publish off status: {}", e);
     } else {
         info!("Off status message queued successfully");
     }
-    
+
     // Process any pending events to ensure message is sent
     info!("Processing final MQTT events...");
     for i in 0..5 {
@@ -73,7 +78,7 @@ pub async fn perform_graceful_shutdown(
         }
         time::sleep(Duration::from_millis(100)).await;
     }
-    
+
     // Explicitly disconnect the MQTT client
     info!("Disconnecting from MQTT broker...");
     if let Err(e) = client.disconnect().await {
@@ -81,7 +86,7 @@ pub async fn perform_graceful_shutdown(
     } else {
         debug!("Successfully disconnected from MQTT broker");
     }
-    
+
     info!("Graceful shutdown completed");
     Ok(())
 }

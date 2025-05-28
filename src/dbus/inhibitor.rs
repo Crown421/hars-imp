@@ -1,44 +1,54 @@
 // Suspend inhibitor functionality - internal utilities for power management
 
-use tokio::sync::broadcast;
-use tracing::{error, info, warn, debug};
-use zbus::{Connection, Result, Proxy};
 use futures::StreamExt;
+use tokio::sync::broadcast;
+use tracing::{debug, error, info, warn};
+use zbus::{Connection, Proxy, Result};
 
 use super::power_management::PowerEvent;
 
-pub struct SuspendInhibitor {
+pub struct Inhibitor {
     _fd: zbus::zvariant::OwnedFd,
+    inhibitor_type: String,
 }
 
-impl SuspendInhibitor {
-    pub async fn new(connection: &Connection, reason: &str) -> Result<Self> {
+impl Inhibitor {
+    pub async fn new_suspend(connection: &Connection, reason: &str) -> Result<Self> {
+        Self::new(connection, "sleep", reason, "delay").await
+    }
+
+    pub async fn new_shutdown(connection: &Connection, reason: &str) -> Result<Self> {
+        Self::new(connection, "shutdown", reason, "delay").await
+    }
+
+    async fn new(connection: &Connection, what: &str, reason: &str, mode: &str) -> Result<Self> {
         let proxy = Proxy::new(
             connection,
             "org.freedesktop.login1",
             "/org/freedesktop/login1",
             "org.freedesktop.login1.Manager",
-        ).await?;
+        )
+        .await?;
 
         // Call Inhibit method to get a file descriptor
         let reply = proxy
-            .call_method(
-                "Inhibit",
-                &("sleep", "mqtt-agent", reason, "delay"),
-            )
+            .call_method("Inhibit", &(what, "mqtt-agent", reason, mode))
             .await?;
 
         // Extract the file descriptor from the reply
         let fd: zbus::zvariant::OwnedFd = reply.body().deserialize()?;
 
-        debug!("Acquired suspend inhibitor lock with reason: {}", reason);
-        Ok(Self { _fd: fd })
+        debug!("Acquired {} inhibitor lock with reason: {}", what, reason);
+        Ok(Self {
+            _fd: fd,
+            inhibitor_type: what.to_string(),
+        })
     }
 }
 
-impl Drop for SuspendInhibitor {
+impl Drop for Inhibitor {
     fn drop(&mut self) {
-        debug!("Released suspend inhibitor lock");
+        debug!("Released {} inhibitor lock", self.inhibitor_type);
     }
 }
 
@@ -46,17 +56,19 @@ pub struct PowerManager {
     event_sender: broadcast::Sender<PowerEvent>,
     event_receiver: broadcast::Receiver<PowerEvent>,
     connection: Option<Connection>,
-    suspend_inhibitor: Option<SuspendInhibitor>,
+    suspend_inhibitor: Option<Inhibitor>,
+    shutdown_inhibitor: Option<Inhibitor>,
 }
 
 impl PowerManager {
     pub(crate) fn new() -> Self {
         let (event_sender, event_receiver) = broadcast::channel(16);
-        Self { 
+        Self {
             event_sender,
             event_receiver,
             connection: None,
             suspend_inhibitor: None,
+            shutdown_inhibitor: None,
         }
     }
 
@@ -67,36 +79,58 @@ impl PowerManager {
             event_receiver,
             connection: None,
             suspend_inhibitor: None,
+            shutdown_inhibitor: None,
         }
     }
 
-    pub async fn reconnect_dbus(&mut self) -> Result<()> {
+    pub async fn connect_dbus(&mut self) -> Result<()> {
         // Try to connect to the system D-Bus
         match Connection::system().await {
             Ok(conn) => {
-                info!("Successfully reconnected to system D-Bus after resume");
+                info!("Successfully connected to system D-Bus");
                 self.connection = Some(conn);
                 Ok(())
             }
-            Err(e) => {
-                Err(zbus::Error::Failure(format!("Failed to reconnect to D-Bus: {}", e)))
-            }
+            Err(e) => Err(zbus::Error::Failure(format!(
+                "Failed to connect to D-Bus: {}",
+                e
+            ))),
         }
     }
 
-    pub async fn create_inhibitor(&mut self, reason: &str) -> Result<()> {
+    pub async fn create_suspend_inhibitor(&mut self, reason: &str) -> Result<()> {
         if let Some(connection) = &self.connection {
-            let inhibitor = SuspendInhibitor::new(connection, reason).await?;
+            let inhibitor = Inhibitor::new_suspend(connection, reason).await?;
             self.suspend_inhibitor = Some(inhibitor);
             Ok(())
         } else {
-            Err(zbus::Error::Failure("No D-Bus connection available".to_string()))
+            Err(zbus::Error::Failure(
+                "No D-Bus connection available".to_string(),
+            ))
         }
     }
-    
-    pub fn release_inhibitor(&mut self) {
+
+    pub async fn create_shutdown_inhibitor(&mut self, reason: &str) -> Result<()> {
+        if let Some(connection) = &self.connection {
+            let inhibitor = Inhibitor::new_shutdown(connection, reason).await?;
+            self.shutdown_inhibitor = Some(inhibitor);
+            Ok(())
+        } else {
+            Err(zbus::Error::Failure(
+                "No D-Bus connection available".to_string(),
+            ))
+        }
+    }
+
+    pub fn release_suspend_inhibitor(&mut self) {
         if self.suspend_inhibitor.take().is_some() {
             debug!("Released suspend inhibitor lock");
+        }
+    }
+
+    pub fn release_shutdown_inhibitor(&mut self) {
+        if self.shutdown_inhibitor.take().is_some() {
+            debug!("Released shutdown inhibitor lock");
         }
     }
 
@@ -104,37 +138,38 @@ impl PowerManager {
         // Try to connect to the system D-Bus
         let connection = match Connection::system().await {
             Ok(conn) => {
-                info!("Successfully connected to system D-Bus");
+                info!("Successfully connected to system D-Bus for monitoring");
                 self.connection = Some(conn.clone());
                 conn
             }
             Err(e) => {
-                warn!("Failed to connect to system D-Bus: {}. Power monitoring will be disabled.", e);
+                warn!(
+                    "Failed to connect to system D-Bus: {}. Power monitoring will be disabled.",
+                    e
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
                 return Ok(());
             }
         };
-        
-        // Create initial suspend inhibitor
-        if let Err(e) = self.create_inhibitor("MQTT daemon startup - preventing unexpected suspension").await {
-            warn!("Failed to create initial suspend inhibitor: {}", e);
-        } else {
-            info!("Created initial suspend inhibitor (delay mode with system default timeout)");
-        }
-        
+
         // Create a proxy for the login1 manager interface
         let proxy = match Proxy::new(
             &connection,
             "org.freedesktop.login1",
             "/org/freedesktop/login1",
             "org.freedesktop.login1.Manager",
-        ).await {
+        )
+        .await
+        {
             Ok(p) => {
                 info!("Successfully created login1 manager proxy");
                 p
             }
             Err(e) => {
-                warn!("Failed to create login1 manager proxy: {}. Power monitoring will be disabled.", e);
+                warn!(
+                    "Failed to create login1 manager proxy: {}. Power monitoring will be disabled.",
+                    e
+                );
                 warn!("This may happen if systemd-logind is not running.");
                 // Keep the monitor "running" but just wait indefinitely
                 tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
@@ -156,9 +191,9 @@ impl PowerManager {
                 return Ok(());
             }
         };
-        
+
         info!("Power monitor started, listening for suspend/resume events");
-        
+
         while let Some(msg) = stream.next().await {
             // Extract the boolean value from the signal
             match msg.body().deserialize::<bool>() {

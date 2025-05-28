@@ -1,8 +1,14 @@
+Top Priority:
+- handle shutdown
+- Scrub config (with password....)
+- Upload to GH
+- Build rpm (via cargo-rpm)
+- Move matcha to switch (needs proper "switch" object, and possibly a new script)
+- Also add light/ dark mode switch?
+
+
 
 High Priority:
-- Add proper logging with tracing
-    - Add log levels: Support different verbosity levels (debug, info, warn, error)
-- Split code into modules: The single main.rs file should be split into multiple modules (config.rs, mqtt.rs, homeassistant.rs, commands.rs)
 - Add unit tests
 - Better Home Assistant Integration
     - More entity types: Support sensors, switches, binary sensors beyond buttons

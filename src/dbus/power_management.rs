@@ -4,9 +4,9 @@ use rumqttc::AsyncClient;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
+use super::inhibitor::PowerManager;
 use crate::status::StatusManager;
 use crate::Config;
-use super::inhibitor::PowerManager;
 
 /// Power event types that can be received from the system
 #[derive(Debug, Clone)]
@@ -15,14 +15,14 @@ pub enum PowerEvent {
     Resuming,
 }
 
-/// Setup function to initialize power monitoring
+/// Setup function to initialize power monitoring and create inhibitors
 /// Returns a PowerManager instance and starts the monitoring task
 pub async fn setup_power_monitoring() -> (PowerManager, tokio::task::JoinHandle<()>) {
-    let power_manager = PowerManager::new();
-    
+    let mut power_manager = PowerManager::new();
+
     // Create a separate instance for the background monitoring task
     let mut monitor_instance = PowerManager::new_with_sender(power_manager.clone_sender());
-    
+
     // Start power monitoring in background
     let monitor_handle = tokio::spawn(async move {
         if let Err(e) = monitor_instance.run_monitor().await {
@@ -30,15 +30,39 @@ pub async fn setup_power_monitoring() -> (PowerManager, tokio::task::JoinHandle<
             warn!("Power monitoring functionality will be unavailable.");
         }
     });
-    
+
+    // Try to create inhibitors on the main power manager instance
+    // We need to establish a D-Bus connection first
+    if let Err(e) = power_manager.connect_dbus().await {
+        warn!("Failed to connect to D-Bus for inhibitors: {}", e);
+    } else {
+        // Create suspend inhibitor
+        if let Err(e) = power_manager
+            .create_suspend_inhibitor("MQTT daemon startup - preventing unexpected suspension")
+            .await
+        {
+            warn!("Failed to create suspend inhibitor: {}", e);
+        } else {
+            info!("Created suspend inhibitor (delay mode with system default timeout)");
+        }
+
+        // Create shutdown inhibitor
+        if let Err(e) = power_manager
+            .create_shutdown_inhibitor("MQTT daemon graceful shutdown - allowing cleanup time")
+            .await
+        {
+            warn!("Failed to create shutdown inhibitor: {}", e);
+        } else {
+            info!("Created shutdown inhibitor (delay mode with system default timeout)");
+        }
+    }
+
     (power_manager, monitor_handle)
 }
 
 /// Function to handle power events in the main tokio select loop
 /// Returns Some(PowerEvent) if an event was received, None if channel is closed
-pub async fn handle_power_events(
-    power_manager: &mut PowerManager,
-) -> Option<PowerEvent> {
+pub async fn handle_power_events(power_manager: &mut PowerManager) -> Option<PowerEvent> {
     match power_manager.get_receiver().recv().await {
         Ok(event) => Some(event),
         Err(broadcast::error::RecvError::Closed) => {
@@ -101,54 +125,61 @@ impl<'a> PowerEventHandler<'a> {
     /// Handle system suspend by gracefully shutting down services
     async fn handle_suspend(&mut self) {
         info!("System is about to suspend, performing shutdown actions...");
-        
+
         // We already have an inhibitor from startup, so we can proceed with shutdown actions
         // The existing inhibitor gives us up to 2 seconds to complete our work
-        
+
         // Perform critical shutdown actions
         if let Err(e) = self.status_manager.publish_suspended().await {
             error!("Failed to publish suspend status: {}", e);
         } else {
             debug!("Successfully published 'Suspended' status before suspend");
         }
-        
+
         // Stop system monitoring
         self.system_monitor_handle.abort();
         debug!("Stopped system monitoring");
-        
+
         // Gracefully disconnect MQTT client
         info!("Disconnecting MQTT client before suspend");
         match self.client.disconnect().await {
             Ok(_) => debug!("MQTT client disconnected cleanly"),
             Err(e) => {
-                if e.to_string().contains("connection closed by peer") || 
-                e.to_string().contains("ConnectionAborted") {
+                if e.to_string().contains("connection closed by peer")
+                    || e.to_string().contains("ConnectionAborted")
+                {
                     debug!("Expected disconnect behavior during suspend: {}", e);
                 } else {
                     warn!("Error during MQTT disconnect: {}", e);
                 }
             }
         }
-        
+
         // Release the inhibitor to allow the system to suspend
-        self.power_manager.release_inhibitor();
+        self.power_manager.release_suspend_inhibitor();
         debug!("Pre-suspend actions completed, released inhibitor to allow system suspend");
     }
 
     /// Handle system resume by re-establishing connections and services
     async fn handle_resume(&mut self) {
         info!("System resumed from suspend, re-establishing connections...");
-        
+
         // Re-initialize MQTT connection
         info!("Re-initializing MQTT connection after resume");
         match crate::initialize_mqtt_connection(self.config).await {
-            Ok((new_client, new_eventloop, new_button_topics, new_status_manager, new_monitoring_handle)) => {
+            Ok((
+                new_client,
+                new_eventloop,
+                new_button_topics,
+                new_status_manager,
+                new_monitoring_handle,
+            )) => {
                 *self.client = new_client;
                 *self.eventloop = new_eventloop;
                 *self.button_topics = new_button_topics;
                 *self.status_manager = new_status_manager;
                 *self.system_monitor_handle = new_monitoring_handle;
-                
+
                 info!("MQTT connection re-established successfully");
                 debug!("Successfully published 'On' status after resume");
             }
@@ -164,18 +195,26 @@ impl<'a> PowerEventHandler<'a> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.power_manager.reconnect_dbus().await {
+            match self.power_manager.connect_dbus().await {
                 Ok(_) => {
-                    debug!("Successfully reconnected to D-Bus after resume (attempt {}/{})", attempt, max_retries);
+                    debug!(
+                        "Successfully reconnected to D-Bus after resume (attempt {}/{})",
+                        attempt, max_retries
+                    );
                     break;
                 }
                 Err(e) => {
                     if attempt >= max_retries {
-                        warn!("Failed to reconnect to D-Bus after {} attempts: {}", max_retries, e);
+                        warn!(
+                            "Failed to reconnect to D-Bus after {} attempts: {}",
+                            max_retries, e
+                        );
                         return; // Don't try to create inhibitor if we can't even connect to D-Bus
                     } else {
-                        debug!("Attempt {}/{} to reconnect to D-Bus failed: {}. Retrying in {}ms", 
-                            attempt, max_retries, e, delay_ms);
+                        debug!(
+                            "Attempt {}/{} to reconnect to D-Bus failed: {}. Retrying in {}ms",
+                            attempt, max_retries, e, delay_ms
+                        );
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         delay_ms *= 2; // Exponential backoff
                     }
@@ -186,14 +225,24 @@ impl<'a> PowerEventHandler<'a> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.power_manager.create_inhibitor("MQTT daemon running - preventing unexpected suspension").await {
+            match self
+                .power_manager
+                .create_suspend_inhibitor("MQTT daemon running - preventing unexpected suspension")
+                .await
+            {
                 Ok(_) => {
-                    debug!("Recreated suspend inhibitor after resume (attempt {}/{})", attempt, max_retries);
+                    debug!(
+                        "Recreated suspend inhibitor after resume (attempt {}/{})",
+                        attempt, max_retries
+                    );
                     break;
                 }
                 Err(e) => {
                     if attempt >= max_retries {
-                        warn!("Failed to recreate suspend inhibitor after {} attempts: {}", max_retries, e);
+                        warn!(
+                            "Failed to recreate suspend inhibitor after {} attempts: {}",
+                            max_retries, e
+                        );
                         break;
                     } else {
                         debug!("Attempt {}/{} to recreate suspend inhibitor failed: {}. Retrying in {}ms", 
