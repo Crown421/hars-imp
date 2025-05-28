@@ -15,7 +15,7 @@ use utils::{Config, init_tracing};
 use commands::{handle_button_press, setup_button_discovery};
 use status::{StatusManager, setup_status_discovery};
 use system_monitor::{SystemMonitor, setup_sensor_discovery};
-use dbus::{setup_power_monitoring, handle_power_events, handle_suspend_actions, handle_resume_actions, PowerEvent}; 
+use dbus::{setup_power_monitoring, handle_power_events}; 
 
 async fn initialize_mqtt_connection(config: &Config) -> Result<(AsyncClient, rumqttc::EventLoop, Vec<(String, String)>, StatusManager, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
     // Set up MQTT options
@@ -128,27 +128,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             power_event = handle_power_events(&mut power_manager) => {
                 if let Some(event) = power_event {
-                    match event {
-                        PowerEvent::Suspending => {
-                            handle_suspend_actions(
-                                &mut power_manager,
-                                &mut client,
-                                &mut status_manager,
-                                &mut system_monitor_handle,
-                            ).await;
-                        }
-                        PowerEvent::Resuming => {
-                            handle_resume_actions(
-                                &mut power_manager,
-                                &mut client,
-                                &mut eventloop,
-                                &mut button_topics,
-                                &mut status_manager,
-                                &mut system_monitor_handle,
-                                || initialize_mqtt_connection(&config),
-                            ).await;
-                        }
-                    }
+                    let mut handler = dbus::PowerEventHandler::new(
+                        &mut power_manager,
+                        &mut client,
+                        &mut eventloop,
+                        &mut button_topics,
+                        &mut status_manager,
+                        &mut system_monitor_handle,
+                        &config,
+                    );
+                    handler.handle_event(event).await;
                 } else {
                     // Power event channel closed, power monitoring stopped
                     debug!("Power monitoring stopped");

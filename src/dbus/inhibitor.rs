@@ -6,7 +6,7 @@ use zbus::{Connection, Result, Proxy};
 use futures::StreamExt;
 use std::os::unix::io::{OwnedFd, FromRawFd, AsRawFd};
 
-use super::power_events::PowerEvent;
+use super::power_management::PowerEvent;
 
 pub struct SuspendInhibitor {
     _fd: OwnedFd,
