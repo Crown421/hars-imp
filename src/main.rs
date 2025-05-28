@@ -49,6 +49,9 @@ async fn initialize_mqtt_connection(config: &Config) -> Result<(AsyncClient, rum
     debug!("Setting up status discovery");
     setup_status_discovery(&client, &config).await?;
     debug!("Status discovery completed");
+
+    info!("Discovery complete, briefly waiting...");
+    time::sleep(Duration::from_millis(500)).await;
     
     // Create status manager and publish initial status
     debug!("Creating status manager");
@@ -146,9 +149,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = signal::ctrl_c() => {
                 info!("Ctrl-C received, shutting down gracefully.");
                 // Publish "Off" status before shutting down
-                if let Err(e) = status_manager.publish_off().await {
-                    error!("Failed to publish off status: {}", e);
-                }
                 break;
             }
         }
@@ -157,6 +157,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure we publish "Off" status before exiting
     if let Err(e) = status_manager.publish_off().await {
         error!("Failed to publish final off status: {}", e);
+    }
+
+    // Process any pending events to ensure message is sent
+    info!("Processing final MQTT events...");
+    for _ in 0..3 {
+        if let Ok(event) = eventloop.poll().await {
+            debug!("Processing shutdown event: {:?}", event);
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+    
+    // Explicitly disconnect the MQTT client
+    info!("Disconnecting from MQTT broker...");
+    if let Err(e) = client.disconnect().await {
+        error!("Error disconnecting from MQTT broker: {}", e);
     }
     
     info!("MQTT daemon shut down.");

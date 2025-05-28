@@ -30,7 +30,7 @@ impl StatusManager {
         info!("Publishing status: {}", status);
         
         match timeout(Duration::from_secs(5), 
-                     self.client.publish(&status_topic, QoS::AtMostOnce, false, status_json)).await {
+                     self.client.publish(&status_topic, QoS::AtLeastOnce, true, status_json)).await {
             Ok(result) => result?,
             Err(_) => {
                 warn!("Timeout publishing status '{}' to topic '{}'", status, status_topic);

@@ -4,12 +4,11 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn, debug};
 use zbus::{Connection, Result, Proxy};
 use futures::StreamExt;
-use std::os::unix::io::{OwnedFd, FromRawFd, AsRawFd};
 
 use super::power_management::PowerEvent;
 
 pub struct SuspendInhibitor {
-    _fd: OwnedFd,
+    _fd: zbus::zvariant::OwnedFd,
 }
 
 impl SuspendInhibitor {
@@ -31,10 +30,9 @@ impl SuspendInhibitor {
 
         // Extract the file descriptor from the reply
         let fd: zbus::zvariant::OwnedFd = reply.body().deserialize()?;
-        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd.as_raw_fd()) };
 
         debug!("Acquired suspend inhibitor lock with reason: {}", reason);
-        Ok(Self { _fd: owned_fd })
+        Ok(Self { _fd: fd })
     }
 }
 
