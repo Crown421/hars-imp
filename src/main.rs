@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, trace, warn};
 
-pub mod commands;
+pub mod buttons;
 pub mod dbus;
 pub mod discovery;
 pub mod shutdown;
@@ -11,7 +11,7 @@ pub mod status;
 pub mod system_monitor;
 pub mod utils;
 
-use commands::{handle_button_press, setup_button_discovery};
+use buttons::{handle_button_press, setup_button_discovery};
 use dbus::{handle_power_events, setup_power_monitoring};
 use shutdown::{perform_graceful_shutdown, ShutdownHandler};
 use status::{setup_status_discovery, StatusManager};

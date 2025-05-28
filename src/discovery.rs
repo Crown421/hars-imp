@@ -2,7 +2,7 @@ use crate::utils::{Config, VersionInfo};
 use rumqttc::{AsyncClient, QoS};
 use serde::Serialize;
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Generic function to publish Home Assistant discovery messages
 pub async fn publish_discovery<T: Serialize>(
