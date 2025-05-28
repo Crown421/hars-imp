@@ -118,10 +118,17 @@ impl<'a> PowerEventHandler<'a> {
         
         // Gracefully disconnect MQTT client
         info!("Disconnecting MQTT client before suspend");
-        self.client.disconnect().await.unwrap_or_else(|e| {
-            warn!("Error during MQTT disconnect: {}", e);
-        });
-        debug!("MQTT client disconnected");
+        match self.client.disconnect().await {
+            Ok(_) => debug!("MQTT client disconnected cleanly"),
+            Err(e) => {
+                if e.to_string().contains("connection closed by peer") || 
+                e.to_string().contains("ConnectionAborted") {
+                    debug!("Expected disconnect behavior during suspend: {}", e);
+                } else {
+                    warn!("Error during MQTT disconnect: {}", e);
+                }
+            }
+        }
         
         // Release the inhibitor to allow the system to suspend
         self.power_manager.release_inhibitor();
@@ -131,13 +138,6 @@ impl<'a> PowerEventHandler<'a> {
     /// Handle system resume by re-establishing connections and services
     async fn handle_resume(&mut self) {
         info!("System resumed from suspend, re-establishing connections...");
-        
-        // Recreate the suspend inhibitor for future suspension events
-        if let Err(e) = self.power_manager.create_inhibitor("MQTT daemon running - preventing unexpected suspension").await {
-            warn!("Failed to recreate suspend inhibitor after resume: {}", e);
-        } else {
-            debug!("Recreated suspend inhibitor after resume");
-        }
         
         // Re-initialize MQTT connection
         info!("Re-initializing MQTT connection after resume");
@@ -155,6 +155,53 @@ impl<'a> PowerEventHandler<'a> {
             Err(e) => {
                 error!("Failed to re-establish MQTT connection after resume: {}", e);
                 // Continue with the old connection and hope it recovers
+            }
+        }
+
+        let max_retries = 3;
+        let mut delay_ms = 500; // Start with 500ms delay
+
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.power_manager.reconnect_dbus().await {
+                Ok(_) => {
+                    debug!("Successfully reconnected to D-Bus after resume (attempt {}/{})", attempt, max_retries);
+                    break;
+                }
+                Err(e) => {
+                    if attempt >= max_retries {
+                        warn!("Failed to reconnect to D-Bus after {} attempts: {}", max_retries, e);
+                        return; // Don't try to create inhibitor if we can't even connect to D-Bus
+                    } else {
+                        debug!("Attempt {}/{} to reconnect to D-Bus failed: {}. Retrying in {}ms", 
+                            attempt, max_retries, e, delay_ms);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        delay_ms *= 2; // Exponential backoff
+                    }
+                }
+            }
+        }
+
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.power_manager.create_inhibitor("MQTT daemon running - preventing unexpected suspension").await {
+                Ok(_) => {
+                    debug!("Recreated suspend inhibitor after resume (attempt {}/{})", attempt, max_retries);
+                    break;
+                }
+                Err(e) => {
+                    if attempt >= max_retries {
+                        warn!("Failed to recreate suspend inhibitor after {} attempts: {}", max_retries, e);
+                        break;
+                    } else {
+                        debug!("Attempt {}/{} to recreate suspend inhibitor failed: {}. Retrying in {}ms", 
+                               attempt, max_retries, e, delay_ms);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        delay_ms *= 2; // Exponential backoff
+                    }
+                }
             }
         }
     }

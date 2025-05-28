@@ -72,6 +72,20 @@ impl PowerManager {
         }
     }
 
+    pub async fn reconnect_dbus(&mut self) -> Result<()> {
+        // Try to connect to the system D-Bus
+        match Connection::system().await {
+            Ok(conn) => {
+                info!("Successfully reconnected to system D-Bus after resume");
+                self.connection = Some(conn);
+                Ok(())
+            }
+            Err(e) => {
+                Err(zbus::Error::Failure(format!("Failed to reconnect to D-Bus: {}", e)))
+            }
+        }
+    }
+
     pub async fn create_inhibitor(&mut self, reason: &str) -> Result<()> {
         if let Some(connection) = &self.connection {
             let inhibitor = SuspendInhibitor::new(connection, reason).await?;

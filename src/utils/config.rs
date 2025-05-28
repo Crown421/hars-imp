@@ -20,7 +20,9 @@ pub struct Config {
     pub button: Option<Vec<Button>>,
     #[serde(skip)]
     pub sensor_topic_base: String,
+    #[serde(skip)]
     pub button_topic: String,
+    #[serde(skip)]
     pub device_discovery_topic: String,
 }
 
