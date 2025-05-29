@@ -5,6 +5,6 @@ pub mod logging;
 pub mod version;
 
 // Re-export commonly used items for convenience
-pub use config::{Button, Config};
+pub use config::{Button, Config, Switch};
 pub use logging::init_tracing;
 pub use version::VersionInfo;

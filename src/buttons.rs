@@ -78,7 +78,7 @@ pub async fn setup_button_discovery(
             );
 
             // Create discovery message
-            let discovery_message = HomeAssistantDiscovery {
+            let discovery_message: HomeAssistantDiscovery = HomeAssistantDiscovery {
                 name: button.name.clone(),
                 command_topic: button_topic.clone(),
                 unique_id: format!(

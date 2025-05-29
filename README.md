@@ -11,6 +11,8 @@ A minimal and efficient Rust daemon for listening to MQTT topics and processing 
 - Automatic reconnection on connection failures
 - **Home Assistant button integration with auto-discovery**
 - **Execute shell commands via button presses**
+- **Home Assistant switch integration with auto-discovery**
+- **Execute shell commands with state management via switch toggles**
 - **System monitoring with Home Assistant sensor discovery**
   - CPU load percentage (reported every 60 seconds)
   - CPU frequency (if available)
@@ -47,6 +49,11 @@ exec = "sudo reboot"
 [[button]]
 name = "Update System"
 exec = "sudo apt update && sudo apt upgrade -y"
+
+# Home Assistant Switches (optional)
+[[switch]]
+name = "Test Switch"               # Switch name shown in Home Assistant
+exec = "echo Switch state:"        # Shell command to execute with "on" or "off" argument
 ```
 
 ## Building and Running
@@ -82,6 +89,23 @@ For a device with hostname `hp-steffen` and a button named `Suspend`:
 - **Command topic**: `homeassistant/button/hp-steffen_suspend/set`
 
 The daemon will automatically handle the naming and topic generation.
+
+### Switch Integration
+
+The daemon also supports Home Assistant switches that can be turned ON/OFF. Switch integration follows this flow:
+
+1. **Discovery**: The daemon publishes discovery messages to `homeassistant/switch/{hostname}_{switch_name}/config`
+2. **Switch Creation**: Home Assistant automatically creates switch entities
+3. **Switch Command**: When toggled in Home Assistant, it sends "ON" or "OFF" to `homeassistant/switch/{hostname}_{switch_name}/set`
+4. **Command Execution**: The daemon executes the configured shell command with "on" or "off" as an argument
+5. **State Publishing**: If the command succeeds, the current state is published to the state topic. If it fails, an empty payload is published.
+
+#### Switch Topics
+
+For a device with hostname `rust-daemon` and a switch named `Test Switch`:
+- **Discovery topic**: `homeassistant/switch/rust-daemon_test_switch/config`
+- **Command topic**: `homeassistant/switch/rust-daemon_test_switch/set`
+- **State topic**: `homeassistant/switch/rust-daemon_test_switch/state`
 
 ### System Monitoring Sensors
 

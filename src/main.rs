@@ -8,6 +8,7 @@ pub mod dbus;
 pub mod discovery;
 pub mod shutdown;
 pub mod status;
+pub mod switch;
 pub mod system_monitor;
 pub mod utils;
 
@@ -15,6 +16,7 @@ use buttons::{handle_button_press, setup_button_discovery};
 use dbus::{handle_power_events, setup_power_monitoring};
 use shutdown::{perform_graceful_shutdown, ShutdownHandler};
 use status::{setup_status_discovery, StatusManager};
+use switch::{handle_switch_command, setup_switch_discovery};
 use system_monitor::{setup_sensor_discovery, SystemMonitor};
 use utils::{init_tracing, Config};
 
@@ -25,6 +27,7 @@ async fn initialize_mqtt_connection(
         AsyncClient,
         rumqttc::EventLoop,
         Vec<(String, String)>,
+        Vec<(String, String, String)>,
         StatusManager,
         tokio::task::JoinHandle<()>,
     ),
@@ -42,6 +45,9 @@ async fn initialize_mqtt_connection(
 
     // Handle button discovery and subscription
     let button_topics = setup_button_discovery(&client, &config).await?;
+
+    // Handle switch discovery and subscription
+    let switch_topics = setup_switch_discovery(&client, &config).await?;
 
     // Setup sensor discovery for system monitoring
     setup_sensor_discovery(&client, &config).await?;
@@ -75,6 +81,7 @@ async fn initialize_mqtt_connection(
         client,
         eventloop,
         button_topics,
+        switch_topics,
         status_manager,
         monitoring_handle,
     ))
@@ -103,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mut client,
         mut eventloop,
         mut button_topics,
+        mut switch_topics,
         mut status_manager,
         mut system_monitor_handle,
     ) = initialize_mqtt_connection(&config).await?;
@@ -126,8 +134,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Check if this is a button press
                                 let button_handled = handle_button_press(topic, &payload, &button_topics).await;
 
-                                // If not a button press, treat as regular message
-                                if !button_handled {
+                                // Check if this is a switch command
+                                let switch_handled = if !button_handled {
+                                    handle_switch_command(topic, &payload, &switch_topics, &client).await
+                                } else {
+                                    false
+                                };
+
+                                // If not a button press or switch command, treat as regular message
+                                if !button_handled && !switch_handled {
                                     info!("Message on topic '{}': {}", topic, payload);
                                 }
                             }
@@ -152,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut client,
                         &mut eventloop,
                         &mut button_topics,
+                        &mut switch_topics,
                         &mut status_manager,
                         &mut system_monitor_handle,
                         &config,

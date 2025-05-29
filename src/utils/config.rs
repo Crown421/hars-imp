@@ -8,6 +8,12 @@ pub struct Button {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct Switch {
+    pub name: String,
+    pub exec: String,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct Config {
     pub hostname: String,
     pub mqtt_url: String,
@@ -17,6 +23,7 @@ pub struct Config {
     pub log_level: String,
     pub update_interval_ms: u64,
     pub button: Option<Vec<Button>>,
+    pub switch: Option<Vec<Switch>>,
     #[serde(skip)]
     pub sensor_topic_base: String,
     #[serde(skip)]

@@ -98,6 +98,7 @@ pub struct PowerEventHandler<'a> {
     client: &'a mut AsyncClient,
     eventloop: &'a mut rumqttc::EventLoop,
     button_topics: &'a mut Vec<(String, String)>,
+    switch_topics: &'a mut Vec<(String, String, String)>,
     status_manager: &'a mut StatusManager,
     system_monitor_handle: &'a mut tokio::task::JoinHandle<()>,
     config: &'a Config,
@@ -110,6 +111,7 @@ impl<'a> PowerEventHandler<'a> {
         client: &'a mut AsyncClient,
         eventloop: &'a mut rumqttc::EventLoop,
         button_topics: &'a mut Vec<(String, String)>,
+        switch_topics: &'a mut Vec<(String, String, String)>,
         status_manager: &'a mut StatusManager,
         system_monitor_handle: &'a mut tokio::task::JoinHandle<()>,
         config: &'a Config,
@@ -119,6 +121,7 @@ impl<'a> PowerEventHandler<'a> {
             client,
             eventloop,
             button_topics,
+            switch_topics,
             status_manager,
             system_monitor_handle,
             config,
@@ -176,12 +179,14 @@ impl<'a> PowerEventHandler<'a> {
                 new_client,
                 new_eventloop,
                 new_button_topics,
+                new_switch_topics,
                 new_status_manager,
                 new_monitoring_handle,
             )) => {
                 *self.client = new_client;
                 *self.eventloop = new_eventloop;
                 *self.button_topics = new_button_topics;
+                *self.switch_topics = new_switch_topics;
                 *self.status_manager = new_status_manager;
                 *self.system_monitor_handle = new_monitoring_handle;
 

@@ -42,6 +42,15 @@ pub struct HomeAssistantSensorDiscovery {
 }
 
 #[derive(Serialize)]
+pub struct HomeAssistantSwitchDiscovery {
+    pub name: String,
+    pub command_topic: String,
+    pub state_topic: String,
+    pub unique_id: String,
+    pub device: HomeAssistantDevice,
+}
+
+#[derive(Serialize)]
 pub struct HomeAssistantDeviceDiscovery {
     #[serde(rename = "dev")]
     pub device: HomeAssistantDevice,
