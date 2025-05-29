@@ -1,4 +1,4 @@
-use crate::discovery::HomeAssistantComponent;
+use crate::ha_mqtt::HomeAssistantComponent;
 use crate::utils::Config;
 use rumqttc::{AsyncClient, QoS};
 use tracing::{debug, error, info};

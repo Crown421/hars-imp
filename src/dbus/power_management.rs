@@ -5,7 +5,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use super::inhibitor::PowerManager;
-use crate::discovery::TopicHandlers;
+use crate::ha_mqtt::TopicHandlers;
 use crate::shutdown::{perform_graceful_mqtt_shutdown, ShutdownScenario};
 use crate::status::StatusManager;
 use crate::Config;

@@ -1,4 +1,4 @@
-use crate::discovery::HomeAssistantComponent;
+use crate::ha_mqtt::HomeAssistantComponent;
 use crate::utils::Config;
 use rumqttc::{AsyncClient, QoS};
 use tracing::{debug, error, info};
@@ -97,7 +97,13 @@ pub async fn handle_switch_command(
 pub async fn create_switch_components_and_setup(
     client: &AsyncClient,
     config: &Config,
-) -> Result<(Vec<(String, HomeAssistantComponent)>, Vec<(String, String, String)>), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Vec<(String, HomeAssistantComponent)>,
+        Vec<(String, String, String)>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let mut switch_components = Vec::new();
     let mut switch_topics = Vec::new();
 
@@ -120,7 +126,7 @@ pub async fn create_switch_components_and_setup(
                 command_topic.clone(),
                 state_topic.clone(),
             );
-            
+
             switch_components.push((switch_id, component));
 
             // Subscribe to switch command topic

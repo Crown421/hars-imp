@@ -3,7 +3,7 @@ use serde::Serialize;
 use sysinfo::System;
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info};
-use crate::discovery::{HomeAssistantComponent};
+use crate::ha_mqtt::{HomeAssistantComponent};
 use crate::utils::Config;
 
 #[derive(Serialize)]
@@ -18,10 +18,15 @@ pub struct SystemPerformanceData {
 impl SystemPerformanceData {
     // Add this new method
     pub fn from_system(system: &System) -> Self {
-        // Get CPU metrics
-        let load_avg = System::load_average();
-        let cpu_count = system.cpus().len() as f64;
-        let cpu_load = (load_avg.one / cpu_count * 100.0) as f32;
+        // Get CPU metrics - calculate average CPU usage across all cores
+        let cpu_load = if !system.cpus().is_empty() {
+            let total_usage: f32 = system.cpus().iter()
+                .map(|cpu| cpu.cpu_usage())
+                .sum();
+            total_usage / system.cpus().len() as f32
+        } else {
+            0.0
+        };
         
         // Get CPU frequency (if available) and convert to GHz
         let cpu_frequency = system.cpus().first()
@@ -91,6 +96,9 @@ impl SystemMonitor {
     pub fn new(sensor_topic_base: String, client: AsyncClient) -> Self {
         let mut system = System::new_all();
         system.refresh_all();
+        // For accurate CPU usage, we need to refresh again after a small delay
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        system.refresh_cpu();
         let sensor_topic = format!("{}/system_performance/state", sensor_topic_base);
         
         Self {
@@ -114,8 +122,9 @@ impl SystemMonitor {
     async fn update_system_metrics(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Updating system metrics");
         
-        // Refresh all system information
-        self.system.refresh_all();
+        // Refresh CPU and memory information
+        self.system.refresh_cpu();
+        self.system.refresh_memory();
         
         // Create performance data using the new method
         let performance_data = SystemPerformanceData::from_system(&self.system);
