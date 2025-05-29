@@ -1,5 +1,4 @@
-use crate::dbus::PowerManager;
-use crate::status::StatusManager;
+use crate::dbus::{PowerManager, StatusManager};
 use rumqttc::{AsyncClient, EventLoop};
 use std::time::Duration;
 use tokio::signal::unix::{signal, Signal, SignalKind};

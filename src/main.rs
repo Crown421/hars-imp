@@ -3,22 +3,19 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, trace, warn};
 
-pub mod buttons;
+pub mod components;
 pub mod dbus;
 pub mod ha_mqtt;
 pub mod shutdown;
-pub mod status;
-pub mod switch;
-pub mod system_monitor;
 pub mod utils;
 
-use buttons::create_button_components_and_setup;
-use dbus::{handle_power_events, setup_power_monitoring};
+use components::{
+    create_button_components_and_setup, create_switch_components_and_setup,
+    create_system_sensor_components, SystemMonitor,
+};
+use dbus::{create_status_component, handle_power_events, setup_power_monitoring, StatusManager};
 use ha_mqtt::{publish_unified_discovery, TopicHandlers};
 use shutdown::{perform_graceful_shutdown, ShutdownHandler};
-use status::{create_status_component, StatusManager};
-use switch::create_switch_components_and_setup;
-use system_monitor::{create_system_sensor_components, SystemMonitor};
 use utils::{init_tracing, Config};
 
 async fn initialize_mqtt_connection(

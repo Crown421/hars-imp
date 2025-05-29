@@ -49,8 +49,8 @@ impl TopicHandlers {
         payload: &str,
         client: &AsyncClient,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        use crate::buttons::execute_command;
-        use crate::switch::execute_switch_command;
+        use crate::components::buttons::execute_command;
+        use crate::components::switch::execute_switch_command;
         use tracing::{debug, error, info};
 
         for handler in &self.handlers {
