@@ -1,4 +1,4 @@
-use crate::discovery::{create_shared_device, publish_discovery, HomeAssistantDiscovery};
+use crate::discovery::HomeAssistantComponent;
 use crate::utils::Config;
 use rumqttc::{AsyncClient, QoS};
 use tracing::{debug, error, info};
@@ -51,47 +51,35 @@ pub async fn handle_button_press(
     false
 }
 
-pub async fn setup_button_discovery(
+/// Creates button components and returns button topics for subscription
+pub async fn create_button_components_and_setup(
     client: &AsyncClient,
     config: &Config,
-) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+) -> Result<
+    (Vec<(String, HomeAssistantComponent)>, Vec<(String, String)>),
+    Box<dyn std::error::Error>,
+> {
+    let mut button_components = Vec::new();
     let mut button_topics = Vec::new();
 
     if let Some(buttons) = &config.button {
         debug!("Setting up {} button(s)", buttons.len());
         for button in buttons {
-            let button_topic = format!(
-                "homeassistant/button/{}/set",
-                format!(
-                    "{}_{}",
-                    config.hostname,
-                    button.name.replace(" ", "_").to_lowercase()
-                )
+            let button_id = format!(
+                "{}_{}",
+                config.hostname,
+                button.name.replace(" ", "_").to_lowercase()
             );
-            let discovery_topic = format!(
-                "homeassistant/button/{}/config",
-                format!(
-                    "{}_{}",
-                    config.hostname,
-                    button.name.replace(" ", "_").to_lowercase()
-                )
+            let button_topic = format!("homeassistant/button/{}/set", button_id);
+
+            // Create component
+            let component = HomeAssistantComponent::button(
+                button.name.clone(),
+                button_id.clone(),
+                button_topic.clone(),
             );
 
-            // Create discovery message
-            let discovery_message: HomeAssistantDiscovery = HomeAssistantDiscovery {
-                name: button.name.clone(),
-                command_topic: button_topic.clone(),
-                unique_id: format!(
-                    "{}_{}",
-                    config.hostname,
-                    button.name.replace(" ", "_").to_lowercase()
-                ),
-                device: create_shared_device(config),
-            };
-
-            // Publish discovery message
-            debug!("Publishing discovery for button '{}'", button.name);
-            publish_discovery(client, &discovery_topic, &discovery_message, true).await?;
+            button_components.push((button_id, component));
 
             // Subscribe to button command topic
             debug!("Subscribing to button topic: {}", button_topic);
@@ -101,5 +89,5 @@ pub async fn setup_button_discovery(
         }
     }
 
-    Ok(button_topics)
+    Ok((button_components, button_topics))
 }

@@ -1,4 +1,4 @@
-use crate::discovery::{create_shared_device, publish_discovery, HomeAssistantSwitchDiscovery};
+use crate::discovery::HomeAssistantComponent;
 use crate::utils::Config;
 use rumqttc::{AsyncClient, QoS};
 use tracing::{debug, error, info};
@@ -93,10 +93,12 @@ pub async fn handle_switch_command(
     false
 }
 
-pub async fn setup_switch_discovery(
+/// Creates switch components and returns switch topics for subscription
+pub async fn create_switch_components_and_setup(
     client: &AsyncClient,
     config: &Config,
-) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<(String, HomeAssistantComponent)>, Vec<(String, String, String)>), Box<dyn std::error::Error>> {
+    let mut switch_components = Vec::new();
     let mut switch_topics = Vec::new();
 
     if let Some(switches) = &config.switch {
@@ -110,20 +112,16 @@ pub async fn setup_switch_discovery(
 
             let command_topic = format!("homeassistant/switch/{}/set", switch_id);
             let state_topic = format!("homeassistant/switch/{}/state", switch_id);
-            let discovery_topic = format!("homeassistant/switch/{}/config", switch_id);
 
-            // Create discovery message
-            let discovery_message = HomeAssistantSwitchDiscovery {
-                name: switch.name.clone(),
-                command_topic: command_topic.clone(),
-                state_topic: state_topic.clone(),
-                unique_id: switch_id,
-                device: create_shared_device(config),
-            };
-
-            // Publish discovery message
-            debug!("Publishing discovery for switch '{}'", switch.name);
-            publish_discovery(client, &discovery_topic, &discovery_message, true).await?;
+            // Create component
+            let component = HomeAssistantComponent::switch(
+                switch.name.clone(),
+                switch_id.clone(),
+                command_topic.clone(),
+                state_topic.clone(),
+            );
+            
+            switch_components.push((switch_id, component));
 
             // Subscribe to switch command topic
             debug!("Subscribing to switch command topic: {}", command_topic);
@@ -133,5 +131,5 @@ pub async fn setup_switch_discovery(
         }
     }
 
-    Ok(switch_topics)
+    Ok((switch_components, switch_topics))
 }

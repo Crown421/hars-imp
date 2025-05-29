@@ -166,7 +166,7 @@ impl PowerManager {
         .await
         {
             Ok(p) => {
-                info!("Successfully created login1 manager proxy");
+                debug!("Successfully created login1 manager proxy");
                 p
             }
             Err(e) => {
@@ -185,7 +185,7 @@ impl PowerManager {
         let sender = self.event_sender.clone();
         let mut stream = match proxy.receive_signal("PrepareForSleep").await {
             Ok(s) => {
-                info!("Successfully subscribed to PrepareForSleep signals");
+                debug!("Successfully subscribed to PrepareForSleep signals");
                 s
             }
             Err(e) => {

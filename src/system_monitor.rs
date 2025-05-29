@@ -3,9 +3,8 @@ use serde::Serialize;
 use sysinfo::System;
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info};
-use std::collections::HashMap;
-use crate::discovery::{publish_discovery, create_shared_device, HomeAssistantDeviceDiscovery, HomeAssistantComponent, HomeAssistantOrigin};
-use crate::utils::{Config, VersionInfo};
+use crate::discovery::{HomeAssistantComponent};
+use crate::utils::Config;
 
 #[derive(Serialize)]
 pub struct SystemPerformanceData {
@@ -137,47 +136,23 @@ impl SystemMonitor {
     }
 }
 
-pub async fn setup_sensor_discovery(
-    client: &AsyncClient,
-    config: &Config,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let device = create_shared_device(config);
-
-    let version_info = VersionInfo::get();
-    let origin = HomeAssistantOrigin {
-        name: "MQTT Agent".to_string(),
-        sw_version: version_info.version.clone(),
-        support_url: version_info.repository.clone(),
-    };
-
-    // Create sensor components from system metrics configuration
-    let mut components = HashMap::new();
+/// Creates system monitoring sensor components
+pub fn create_system_sensor_components(config: &Config) -> Vec<(String, HomeAssistantComponent)> {
+    let mut components = Vec::new();
     let state_topic = format!("{}/system_performance/state", config.sensor_topic_base);
     
     for metric in SYSTEM_METRICS {
         let component_id = format!("{}_{}", config.hostname, metric.json_field);
-        let component = HomeAssistantComponent {
-            name: format!("{} {}", config.hostname, metric.name),
-            platform: "sensor".to_string(),
-            device_class: metric.device_class.map(|s| s.to_string()),
-            unit_of_measurement: metric.unit.map(|s| s.to_string()),
-            value_template: format!("{{{{ value_json.{} }}}}", metric.json_field),
-            unique_id: component_id.clone(),
-        };
-        components.insert(component_id, component);
+        let component = HomeAssistantComponent::sensor(
+            format!("{} {}", config.hostname, metric.name),
+            component_id.clone(),
+            state_topic.clone(),
+            metric.device_class.map(|s| s.to_string()),
+            metric.unit.map(|s| s.to_string()),
+            format!("{{{{ value_json.{} }}}}", metric.json_field),
+        );
+        components.push((component_id, component));
     }
-
-    // Create device discovery payload
-    let device_discovery = HomeAssistantDeviceDiscovery {
-        device: device.clone(),
-        origin,
-        components,
-        state_topic,
-    };
-
-    // Publish single device discovery message
-    info!("Publishing device discovery for '{}'", config.hostname);
-    publish_discovery(client, &config.device_discovery_topic, &device_discovery, true).await?;
-
-    Ok(())
+    
+    components
 }

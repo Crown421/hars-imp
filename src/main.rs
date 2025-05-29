@@ -12,12 +12,13 @@ pub mod switch;
 pub mod system_monitor;
 pub mod utils;
 
-use buttons::{handle_button_press, setup_button_discovery};
+use buttons::create_button_components_and_setup;
 use dbus::{handle_power_events, setup_power_monitoring};
+use discovery::{publish_unified_discovery, TopicHandlers};
 use shutdown::{perform_graceful_shutdown, ShutdownHandler};
-use status::{setup_status_discovery, StatusManager};
-use switch::{handle_switch_command, setup_switch_discovery};
-use system_monitor::{setup_sensor_discovery, SystemMonitor};
+use status::{create_status_component, StatusManager};
+use switch::create_switch_components_and_setup;
+use system_monitor::{create_system_sensor_components, SystemMonitor};
 use utils::{init_tracing, Config};
 
 async fn initialize_mqtt_connection(
@@ -26,8 +27,7 @@ async fn initialize_mqtt_connection(
     (
         AsyncClient,
         rumqttc::EventLoop,
-        Vec<(String, String)>,
-        Vec<(String, String, String)>,
+        TopicHandlers,
         StatusManager,
         tokio::task::JoinHandle<()>,
     ),
@@ -43,17 +43,44 @@ async fn initialize_mqtt_connection(
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
     debug!("MQTT client created successfully");
 
-    // Handle button discovery and subscription
-    let button_topics = setup_button_discovery(&client, &config).await?;
+    // Collect all components for unified discovery
+    let mut all_components = Vec::new();
+    let mut topic_handlers = TopicHandlers::new();
 
-    // Handle switch discovery and subscription
-    let switch_topics = setup_switch_discovery(&client, &config).await?;
+    // Handle button components and subscriptions
+    let (button_components, button_topics) =
+        create_button_components_and_setup(&client, config).await?;
+    all_components.extend(button_components);
 
-    // Setup sensor discovery for system monitoring
-    setup_sensor_discovery(&client, &config).await?;
+    // Add button topics to unified handlers
+    for (topic, exec_command) in button_topics {
+        topic_handlers.add_button(topic, exec_command);
+    }
 
-    // Setup status sensor discovery
-    setup_status_discovery(&client, &config).await?;
+    // Handle switch components and subscriptions
+    let (switch_components, switch_topics) =
+        create_switch_components_and_setup(&client, config).await?;
+    all_components.extend(switch_components);
+
+    // Add switch topics to unified handlers
+    for (command_topic, state_topic, exec_command) in switch_topics {
+        topic_handlers.add_switch(command_topic, state_topic, exec_command);
+    }
+
+    // Create system monitoring sensor components
+    let system_components = create_system_sensor_components(config);
+    all_components.extend(system_components);
+
+    // Create status sensor component
+    let (status_id, status_component) = create_status_component(config);
+    all_components.push((status_id, status_component));
+
+    // Publish unified device discovery with all components
+    info!(
+        "Publishing unified device discovery with {} components",
+        all_components.len()
+    );
+    publish_unified_discovery(&client, config, all_components).await?;
 
     info!("Discovery complete, briefly waiting...");
     time::sleep(Duration::from_millis(500)).await;
@@ -80,8 +107,7 @@ async fn initialize_mqtt_connection(
     Ok((
         client,
         eventloop,
-        button_topics,
-        switch_topics,
+        topic_handlers,
         status_manager,
         monitoring_handle,
     ))
@@ -109,8 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (
         mut client,
         mut eventloop,
-        mut button_topics,
-        mut switch_topics,
+        mut topic_handlers,
         mut status_manager,
         mut system_monitor_handle,
     ) = initialize_mqtt_connection(&config).await?;
@@ -131,19 +156,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let payload = String::from_utf8_lossy(&publish.payload);
                                 trace!("Received message on topic '{}': {}", topic, payload);
 
-                                // Check if this is a button press
-                                let button_handled = handle_button_press(topic, &payload, &button_topics).await;
-
-                                // Check if this is a switch command
-                                let switch_handled = if !button_handled {
-                                    handle_switch_command(topic, &payload, &switch_topics, &client).await
-                                } else {
-                                    false
-                                };
-
-                                // If not a button press or switch command, treat as regular message
-                                if !button_handled && !switch_handled {
-                                    info!("Message on topic '{}': {}", topic, payload);
+                                // Check if this message should be handled by our topic handlers
+                                match topic_handlers.handle_message(topic, &payload, &client).await {
+                                    Ok(true) => {
+                                        // Message was handled by a topic handler
+                                    }
+                                    Ok(false) => {
+                                        // Message not handled, treat as regular message
+                                        info!("Message on topic '{}': {}", topic, payload);
+                                    }
+                                    Err(e) => {
+                                        error!("Error handling message on topic '{}': {}", topic, e);
+                                    }
                                 }
                             }
                             event => {
@@ -166,8 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut power_manager,
                         &mut client,
                         &mut eventloop,
-                        &mut button_topics,
-                        &mut switch_topics,
+                        &mut topic_handlers,
                         &mut status_manager,
                         &mut system_monitor_handle,
                         &config,
