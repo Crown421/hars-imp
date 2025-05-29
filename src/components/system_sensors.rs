@@ -200,9 +200,9 @@ pub fn create_system_sensor_components(config: &Config) -> Vec<(String, HomeAssi
     let state_topic = format!("{}/system_performance/state", config.sensor_topic_base);
     
     for metric in SYSTEM_METRICS {
-        let component_id = format!("{}_{}", config.hostname, metric.json_field);
+        let component_id = metric.json_field.to_string();
         let component = HomeAssistantComponent::sensor(
-            format!("{} {}", config.hostname, metric.name),
+            metric.name.to_string(),
             component_id.clone(),
             state_topic.clone(),
             metric.device_class.map(|s| s.to_string()),

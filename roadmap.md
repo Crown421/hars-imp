@@ -1,6 +1,6 @@
 Top Priority:
 - Build rpm (via cargo-rpm)
-- Move matcha to switch (needs proper "switch" object, and possibly a new script)
+- Change switch to also run exec command + "status", to give current status during discovery
 - Also add light/ dark mode switch?
 
 
