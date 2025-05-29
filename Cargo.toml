@@ -1,5 +1,5 @@
 [package]
-name = "mqtt-daemon"
+name = "hars-imp"
 version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/your-repo/mqtt-agent"

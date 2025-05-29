@@ -17,7 +17,7 @@ use utils::{init_tracing, Config};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration
-    let config = Config::load_from_file("config.toml")?;
+    let config = Config::load()?;
 
     // Initialize tracing with the configured log level
     init_tracing(&config.log_level)?;

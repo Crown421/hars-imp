@@ -501,6 +501,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
 
 [[package]]
+name = "hars-imp"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "rumqttc",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -610,22 +626,6 @@ dependencies = [
  "libc",
  "wasi 0.11.0+wasi-snapshot-preview1",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "mqtt-daemon"
-version = "0.1.0"
-dependencies = [
- "futures",
- "rumqttc",
- "serde",
- "serde_json",
- "sysinfo",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "zbus",
 ]
 
 [[package]]

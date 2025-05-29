@@ -172,7 +172,7 @@ impl<'a> PowerEventHandler<'a> {
 
         // Re-initialize MQTT connection
         info!("Re-initializing MQTT connection after resume");
-        match crate::initialize_mqtt_connection(self.config).await {
+        match crate::ha_mqtt::initialize_mqtt_connection(self.config).await {
             Ok((
                 new_client,
                 new_eventloop,

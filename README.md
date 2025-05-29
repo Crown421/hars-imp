@@ -1,6 +1,6 @@
-# MQTT Daemon
+# hars-imp
 
-A minimal and efficient Rust daemon for listening to MQTT topics and processing messages.
+A minimal and efficient Rust daemon for interacting with Home Assistant via MQTT
 
 ## Features
 

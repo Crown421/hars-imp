@@ -33,6 +33,28 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let config_path = Self::get_config_path()?;
+        Self::load_from_file(&config_path)
+    }
+
+    pub fn get_config_path() -> Result<String, Box<dyn std::error::Error>> {
+        #[cfg(debug_assertions)]
+        {
+            // In debug mode, look for config.toml in the current directory
+            Ok("config.toml".to_string())
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            // In release mode, look for config.toml in $HOME/.config/hars-imp
+            let home = std::env::var("HOME").map_err(|_| "HOME environment variable not set")?;
+            let config_path = format!("{}/.config/hars-imp/config.toml", home);
+
+            Ok(config_path)
+        }
+    }
+
     pub fn load_from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = fs::read_to_string(path)?;
         let mut config: Config = toml::from_str(&contents)?;

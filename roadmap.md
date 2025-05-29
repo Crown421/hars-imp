@@ -1,7 +1,4 @@
 Top Priority:
-- handle shutdown
-- Scrub config (with password....)
-- Upload to GH
 - Build rpm (via cargo-rpm)
 - Move matcha to switch (needs proper "switch" object, and possibly a new script)
 - Also add light/ dark mode switch?
