@@ -1,7 +1,7 @@
 [package]
 name = "hars-imp"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 repository = "https://github.com/your-repo/mqtt-agent"
 
 # Add binary optimization profiles
@@ -16,7 +16,7 @@ strip = true      # Automatically strip symbols from the binary
 rumqttc = { version = "0.24", default-features = false, features = [
     "use-rustls",
 ] }
-tokio = { version = "1.0", default-features = false, features = [
+tokio = { version = "1.45", default-features = false, features = [
     "rt-multi-thread",
     "macros",
     "time",
@@ -33,6 +33,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "ansi",
 ] }
-sysinfo = { version = "0.30", default-features = false }
-zbus = { version = "5.7.1", default-features = false, features = ["tokio"] }
+sysinfo = { version = "0.35", default-features = false, features = [
+    "system",
+    "disk",
+] }
+zbus = { version = "5.7", default-features = false, features = ["tokio"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
