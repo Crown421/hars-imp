@@ -141,9 +141,6 @@ impl SystemMonitor {
     pub fn new(sensor_topic_base: String, client: AsyncClient) -> Self {
         let mut system = System::new_all();
         system.refresh_all();
-        // For accurate CPU usage, we need to refresh again after a small delay
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        system.refresh_cpu();
         let sensor_topic = format!("{}/system_performance/state", sensor_topic_base);
         
         Self {
@@ -154,6 +151,10 @@ impl SystemMonitor {
     }
 
     pub async fn run_monitoring_loop(&mut self) {
+        // For accurate CPU usage, we need to refresh again after a small delay
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        self.system.refresh_cpu();
+        
         let mut interval = time::interval(Duration::from_secs(60));
 
         loop {
