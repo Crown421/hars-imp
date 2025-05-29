@@ -21,6 +21,15 @@ pub struct TopicHandlers {
 }
 
 impl TopicHandlers {
+    /// Creates a new empty TopicHandlers instance.
+    ///
+    /// # Returns
+    /// * `Self` - A new TopicHandlers instance with no registered handlers
+    ///
+    /// # Examples
+    /// ```
+    /// let handlers = TopicHandlers::new();
+    /// ```
     pub fn new() -> Self {
         Self {
             handlers: Vec::new(),

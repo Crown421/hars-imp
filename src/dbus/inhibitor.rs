@@ -220,6 +220,18 @@ impl PowerManager {
         self.event_sender.clone()
     }
 
+    /// Gets a mutable reference to the power event receiver.
+    ///
+    /// This method is used to receive power events from the monitoring task
+    /// in the main application loop.
+    ///
+    /// # Returns
+    /// * `&mut broadcast::Receiver<PowerEvent>` - Mutable reference to the event receiver
+    ///
+    /// # Examples
+    /// ```
+    /// let receiver = power_manager.get_receiver();
+    /// ```
     pub fn get_receiver(&mut self) -> &mut broadcast::Receiver<PowerEvent> {
         &mut self.event_receiver
     }
