@@ -1,6 +1,6 @@
 use rumqttc::{AsyncClient, QoS};
 use serde::Serialize;
-use sysinfo::System;
+use sysinfo::{Disks, System};
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info};
 use crate::ha_mqtt::{HomeAssistantComponent};
@@ -13,6 +13,9 @@ pub struct SystemPerformanceData {
     pub memory_total: f32,
     pub memory_free: f32,
     pub memory_free_percentage: f32,
+    pub disk_total: f32,
+    pub disk_free: f32,
+    pub disk_free_percentage: f32,
 }
 
 impl SystemPerformanceData {
@@ -43,6 +46,42 @@ impl SystemPerformanceData {
         let free_memory_gb = free_memory as f32 / 1024.0 / 1024.0 / 1024.0;
         let free_percentage = (free_memory as f32 / total_memory as f32) * 100.0;
         
+        // Get disk metrics for root filesystem
+        // Try to find /sysroot first (for immutable OS like Fedora Silverblue/Kinoite)
+        // Fall back to / if /sysroot is not available
+        let disks = Disks::new_with_refreshed_list();
+        let (disk_total_gb, disk_free_gb, disk_free_percentage) = disks
+            .iter()
+            .find(|disk| {
+                let mount_point = disk.mount_point().to_str().unwrap_or("");
+                mount_point == "/sysroot" || mount_point == "/"
+            })
+            .and_then(|disk| {
+                // Skip very small filesystems (less than 1GB) like composefs overlays
+                if disk.total_space() < 1_073_741_824 { // 1GB in bytes
+                    None
+                } else {
+                    let total = disk.total_space() as f32 / 1024.0 / 1024.0 / 1024.0;
+                    let available = disk.available_space() as f32 / 1024.0 / 1024.0 / 1024.0;
+                    let percentage = if total > 0.0 { (available / total) * 100.0 } else { 0.0 };
+                    Some((total, available, percentage))
+                }
+            })
+            .unwrap_or_else(|| {
+                // If no suitable disk found, try to find the largest disk as fallback
+                disks
+                    .iter()
+                    .filter(|disk| disk.total_space() >= 1_073_741_824) // At least 1GB
+                    .max_by_key(|disk| disk.total_space())
+                    .map(|disk| {
+                        let total = disk.total_space() as f32 / 1024.0 / 1024.0 / 1024.0;
+                        let available = disk.available_space() as f32 / 1024.0 / 1024.0 / 1024.0;
+                        let percentage = if total > 0.0 { (available / total) * 100.0 } else { 0.0 };
+                        (total, available, percentage)
+                    })
+                    .unwrap_or((0.0, 0.0, 0.0))
+            });
+        
         // Return performance data with values rounded to 2 decimal places
         Self {
             cpu_load: (cpu_load * 100.0).round() / 100.0,
@@ -50,6 +89,9 @@ impl SystemPerformanceData {
             memory_total: (total_memory_gb * 100.0).round() / 100.0,
             memory_free: (free_memory_gb * 100.0).round() / 100.0,
             memory_free_percentage: (free_percentage * 100.0).round() / 100.0,
+            disk_total: (disk_total_gb * 100.0).round() / 100.0,
+            disk_free: (disk_free_gb * 100.0).round() / 100.0,
+            disk_free_percentage: (disk_free_percentage * 100.0).round() / 100.0,
         }
     }
 }
@@ -84,6 +126,9 @@ pub const SYSTEM_METRICS: &[MetricConfig] = &[
     MetricConfig::new("Memory Total", "memory_total", Some("GB"), Some("data_size")),
     MetricConfig::new("Memory Free", "memory_free", Some("GB"), Some("data_size")),
     MetricConfig::new("Memory Free %", "memory_free_percentage", Some("%"), None),
+    MetricConfig::new("Disk Total", "disk_total", Some("GB"), Some("data_size")),
+    MetricConfig::new("Disk Free", "disk_free", Some("GB"), Some("data_size")),
+    MetricConfig::new("Disk Free %", "disk_free_percentage", Some("%"), None),
 ];
 
 pub struct SystemMonitor {
@@ -129,12 +174,15 @@ impl SystemMonitor {
         // Create performance data using the new method
         let performance_data = SystemPerformanceData::from_system(&self.system);
         
-        info!("Publishing system performance - CPU: {:.2}%, Freq: {:?} GHz, Memory: {:.2}/{:.2} GB ({:.1}% free)", 
+        info!("Publishing system performance - CPU: {:.2}%, Freq: {:?} GHz, Memory: {:.2}/{:.2} GB ({:.1}% free), Disk: {:.2}/{:.2} GB ({:.1}% free)", 
             performance_data.cpu_load, 
             performance_data.cpu_frequency, 
             performance_data.memory_free, 
             performance_data.memory_total, 
-            performance_data.memory_free_percentage);
+            performance_data.memory_free_percentage,
+            performance_data.disk_free,
+            performance_data.disk_total,
+            performance_data.disk_free_percentage);
 
         // Publish to single topic
         let performance_json = serde_json::to_string(&performance_data)?;
