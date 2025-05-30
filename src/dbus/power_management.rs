@@ -5,10 +5,10 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use super::inhibitor::PowerManager;
+use crate::Config;
 use crate::dbus::status::StatusManager;
 use crate::ha_mqtt::TopicHandlers;
-use crate::shutdown::{perform_graceful_mqtt_shutdown, ShutdownScenario};
-use crate::Config;
+use crate::shutdown::{ShutdownScenario, perform_graceful_mqtt_shutdown};
 
 /// Power event types that can be received from the system
 #[derive(Debug, Clone)]
@@ -84,15 +84,11 @@ pub async fn handle_power_events(power_manager: &mut PowerManager) -> Option<Pow
         }
         Err(broadcast::error::RecvError::Lagged(skipped)) => {
             warn!("Power event receiver lagged, skipped {} events", skipped);
-            // Try to receive the next event
-            match power_manager.get_receiver().recv().await {
-                Ok(event) => Some(event),
-                Err(_) => None,
-            }
+            // Try to receive the next event without the nested match
+            power_manager.get_receiver().recv().await.ok()
         }
     }
 }
-
 /// Handler for power events that encapsulates all power management actions
 pub struct PowerEventHandler<'a> {
     power_manager: &'a mut PowerManager,
@@ -166,6 +162,52 @@ impl<'a> PowerEventHandler<'a> {
         debug!("Pre-suspend actions completed, released inhibitor to allow system suspend");
     }
 
+    /// Helper method for retry logic with exponential backoff
+    async fn retry_dbus_operation<T, E>(
+        &mut self,
+        operation_name: &str,
+        operation: impl Fn(
+            &mut PowerManager,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, E>> + '_>>,
+        max_retries: u32,
+    ) -> Result<T, E>
+    where
+        E: std::fmt::Display,
+    {
+        let mut attempt = 0;
+        let mut delay_ms = 500; // Start with 500ms delay
+
+        loop {
+            attempt += 1;
+            match operation(self.power_manager).await {
+                Ok(result) => {
+                    debug!(
+                        "{} succeeded (attempt {}/{})",
+                        operation_name, attempt, max_retries
+                    );
+                    return Ok(result);
+                }
+                Err(e) => {
+                    if attempt >= max_retries {
+                        warn!(
+                            "Failed {} after {} attempts: {}",
+                            operation_name, max_retries, e
+                        );
+                        return Err(e);
+                    } else {
+                        debug!(
+                            "Attempt {}/{} for {} failed: {}. Retrying in {}ms",
+                            attempt, max_retries, operation_name, e, delay_ms
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        delay_ms *= 2; // Exponential backoff
+                    }
+                }
+            }
+        }
+    }
+
     /// Handle system resume by re-establishing connections and services
     async fn handle_resume(&mut self) {
         info!("System resumed from suspend, re-establishing connections...");
@@ -195,69 +237,36 @@ impl<'a> PowerEventHandler<'a> {
             }
         }
 
+        // Reconnect to D-Bus with retry
         let max_retries = 3;
-        let mut delay_ms = 500; // Start with 500ms delay
 
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self.power_manager.connect_dbus().await {
-                Ok(_) => {
-                    debug!(
-                        "Successfully reconnected to D-Bus after resume (attempt {}/{})",
-                        attempt, max_retries
-                    );
-                    break;
-                }
-                Err(e) => {
-                    if attempt >= max_retries {
-                        warn!(
-                            "Failed to reconnect to D-Bus after {} attempts: {}",
-                            max_retries, e
-                        );
-                        return; // Don't try to create inhibitor if we can't even connect to D-Bus
-                    } else {
-                        debug!(
-                            "Attempt {}/{} to reconnect to D-Bus failed: {}. Retrying in {}ms",
-                            attempt, max_retries, e, delay_ms
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        delay_ms *= 2; // Exponential backoff
-                    }
-                }
-            }
+        // Try to reconnect to D-Bus
+        if let Err(e) = self
+            .retry_dbus_operation(
+                "D-Bus reconnection",
+                |pm| Box::pin(pm.connect_dbus()),
+                max_retries,
+            )
+            .await
+        {
+            warn!("Failed to reconnect to D-Bus: {}", e);
+            return; // Don't try to create inhibitor if we can't connect to D-Bus
         }
 
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self
-                .power_manager
-                .create_suspend_inhibitor("MQTT daemon running - preventing unexpected suspension")
-                .await
-            {
-                Ok(_) => {
-                    debug!(
-                        "Recreated suspend inhibitor after resume (attempt {}/{})",
-                        attempt, max_retries
-                    );
-                    break;
-                }
-                Err(e) => {
-                    if attempt >= max_retries {
-                        warn!(
-                            "Failed to recreate suspend inhibitor after {} attempts: {}",
-                            max_retries, e
-                        );
-                        break;
-                    } else {
-                        debug!("Attempt {}/{} to recreate suspend inhibitor failed: {}. Retrying in {}ms", 
-                               attempt, max_retries, e, delay_ms);
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        delay_ms *= 2; // Exponential backoff
-                    }
-                }
-            }
+        // Recreate suspend inhibitor
+        if let Err(e) = self
+            .retry_dbus_operation(
+                "Suspend inhibitor recreation",
+                |pm| {
+                    Box::pin(pm.create_suspend_inhibitor(
+                        "MQTT daemon running - preventing unexpected suspension",
+                    ))
+                },
+                max_retries,
+            )
+            .await
+        {
+            warn!("Failed to recreate suspend inhibitor: {}", e);
         }
     }
 }

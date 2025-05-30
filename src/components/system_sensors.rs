@@ -6,7 +6,19 @@ use sysinfo::{CpuRefreshKind, DiskRefreshKind, Disks, MemoryRefreshKind, Refresh
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info};
 
-#[derive(Serialize)]
+// Constants for magic numbers
+const BYTES_TO_GB: f32 = 1024.0 * 1024.0 * 1024.0;
+const MIN_DISK_SIZE_BYTES: u64 = 1_073_741_824; // 1GB
+const CPU_REFRESH_DELAY_MS: u64 = 200;
+const METRICS_INTERVAL_SECS: u64 = 60;
+const MHZ_TO_GHZ: f32 = 1000.0;
+
+// Helper function to round values to 2 decimal places
+fn round_to_2dp(value: f32) -> f32 {
+    (value * 100.0).round() / 100.0
+}
+
+#[derive(Serialize, Debug, Clone)]
 pub struct SystemPerformanceData {
     pub cpu_load: f32,
     pub cpu_frequency: Option<f32>,
@@ -21,8 +33,8 @@ pub struct SystemPerformanceData {
 impl SystemPerformanceData {
     /// Helper function to calculate disk metrics in GB from bytes
     fn calculate_disk_metrics_gb(total_bytes: u64, available_bytes: u64) -> (f32, f32, f32) {
-        let total = total_bytes as f32 / 1024.0 / 1024.0 / 1024.0;
-        let available = available_bytes as f32 / 1024.0 / 1024.0 / 1024.0;
+        let total = total_bytes as f32 / BYTES_TO_GB;
+        let available = available_bytes as f32 / BYTES_TO_GB;
         let percentage = if total > 0.0 {
             (available / total) * 100.0
         } else {
@@ -48,15 +60,15 @@ impl SystemPerformanceData {
             .first()
             .map(|cpu| cpu.frequency())
             .filter(|&freq| freq > 0)
-            .map(|freq| freq as f32 / 1000.0);
+            .map(|freq| freq as f32 / MHZ_TO_GHZ);
 
         // Get memory metrics
         let total_memory = system.total_memory();
         let free_memory = system.available_memory();
 
         // Convert to GB
-        let total_memory_gb = total_memory as f32 / 1024.0 / 1024.0 / 1024.0;
-        let free_memory_gb = free_memory as f32 / 1024.0 / 1024.0 / 1024.0;
+        let total_memory_gb = total_memory as f32 / BYTES_TO_GB;
+        let free_memory_gb = free_memory as f32 / BYTES_TO_GB;
         let free_percentage = (free_memory as f32 / total_memory as f32) * 100.0;
 
         // Use the provided disk metrics
@@ -64,14 +76,14 @@ impl SystemPerformanceData {
 
         // Return performance data with values rounded to 2 decimal places
         Self {
-            cpu_load: (cpu_load * 100.0).round() / 100.0,
-            cpu_frequency: cpu_frequency.map(|f| (f * 100.0).round() / 100.0),
-            memory_total: (total_memory_gb * 100.0).round() / 100.0,
-            memory_free: (free_memory_gb * 100.0).round() / 100.0,
-            memory_free_percentage: (free_percentage * 100.0).round() / 100.0,
-            disk_total: (disk_total_gb * 100.0).round() / 100.0,
-            disk_free: (disk_free_gb * 100.0).round() / 100.0,
-            disk_free_percentage: (disk_free_percentage * 100.0).round() / 100.0,
+            cpu_load: round_to_2dp(cpu_load),
+            cpu_frequency: cpu_frequency.map(round_to_2dp),
+            memory_total: round_to_2dp(total_memory_gb),
+            memory_free: round_to_2dp(free_memory_gb),
+            memory_free_percentage: round_to_2dp(free_percentage),
+            disk_total: round_to_2dp(disk_total_gb),
+            disk_free: round_to_2dp(disk_free_gb),
+            disk_free_percentage: round_to_2dp(disk_free_percentage),
         }
     }
 }
@@ -126,16 +138,31 @@ pub struct SystemMonitor {
 }
 
 impl SystemMonitor {
+    /// Create system refresh kind configuration
+    fn create_system_refresh_kind() -> RefreshKind {
+        RefreshKind::nothing()
+            .with_memory(MemoryRefreshKind::everything().without_swap())
+            .with_cpu(CpuRefreshKind::everything())
+    }
+
+    /// Create disk refresh kind configuration
+    fn create_disk_refresh_kind() -> DiskRefreshKind {
+        DiskRefreshKind::nothing().with_storage()
+    }
+
+    /// Create topic string from components
+    fn create_topic(base: &str, component: &str, suffix: &str) -> String {
+        format!("{}/{}/{}", base, component, suffix)
+    }
+
     pub fn new(sensor_topic_base: String, client: AsyncClient) -> Self {
         // Use the new RefreshKind API to initialize system with specific refresh kinds
-        let refresh_kind =
-            RefreshKind::everything().with_memory(MemoryRefreshKind::everything().without_swap());
+        let refresh_kind = Self::create_system_refresh_kind();
 
         let system = System::new_with_specifics(refresh_kind);
         // Initialize disks with storage-only refresh since we only need space information
-        let disks =
-            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
-        let sensor_topic = format!("{}/system_performance/state", sensor_topic_base);
+        let disks = Disks::new_with_refreshed_list_specifics(Self::create_disk_refresh_kind());
+        let sensor_topic = Self::create_topic(&sensor_topic_base, "system_performance", "state");
 
         // Find and cache the root disk index once during initialization
         let root_disk_index = Self::find_root_disk_index(&disks);
@@ -154,28 +181,30 @@ impl SystemMonitor {
     /// Find the root disk index once during initialization
     /// Returns the disk index if found, None otherwise
     fn find_root_disk_index(disks: &Disks) -> Option<usize> {
-        // Try to find /sysroot first (for immutable OS like Fedora Silverblue/Kinoite)
-        // Fall back to / if /sysroot is not available
-        disks
-            .list()
+        let disk_list = disks.list();
+
+        // First try to find the root mount point
+        let root_index = disk_list
             .iter()
             .enumerate()
             .find(|(_, disk)| {
                 let mount_point = disk.mount_point().to_str().unwrap_or("");
                 (mount_point == "/sysroot" || mount_point == "/")
-                    && disk.total_space() >= 1_073_741_824 // At least 1GB
+                    && disk.total_space() >= MIN_DISK_SIZE_BYTES
             })
-            .map(|(index, _)| index)
-            .or_else(|| {
-                // If no suitable root disk found, try to find the largest disk as fallback
-                disks
-                    .list()
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, disk)| disk.total_space() >= 1_073_741_824) // At least 1GB
-                    .max_by_key(|(_, disk)| disk.total_space())
-                    .map(|(index, _)| index)
-            })
+            .map(|(idx, _)| idx);
+
+        if root_index.is_some() {
+            return root_index;
+        }
+
+        // Fallback to largest disk
+        disk_list
+            .iter()
+            .enumerate()
+            .filter(|(_, disk)| disk.total_space() >= MIN_DISK_SIZE_BYTES)
+            .max_by_key(|(_, disk)| disk.total_space())
+            .map(|(idx, _)| idx)
     }
 
     /// Get disk metrics for the cached root disk
@@ -197,17 +226,14 @@ impl SystemMonitor {
 
     pub async fn run_monitoring_loop(&mut self) {
         // Create the refresh kinds once and reuse them throughout the monitoring loop
-        let system_refresh_kind = RefreshKind::nothing()
-            .with_memory(MemoryRefreshKind::everything().without_swap())
-            .with_cpu(CpuRefreshKind::everything());
-
-        let disk_refresh_kind = DiskRefreshKind::nothing().with_storage();
+        let system_refresh_kind = Self::create_system_refresh_kind();
+        let disk_refresh_kind = Self::create_disk_refresh_kind();
 
         // For accurate CPU usage, we need to refresh again after a small delay
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(CPU_REFRESH_DELAY_MS)).await;
         self.system.refresh_specifics(system_refresh_kind);
 
-        let mut interval = time::interval(Duration::from_secs(60));
+        let mut interval = time::interval(Duration::from_secs(METRICS_INTERVAL_SECS));
 
         loop {
             interval.tick().await;
@@ -265,7 +291,8 @@ impl SystemMonitor {
 /// Creates system monitoring sensor components
 pub fn create_system_sensor_components(config: &Config) -> Vec<(String, HomeAssistantComponent)> {
     let mut components = Vec::new();
-    let state_topic = format!("{}/system_performance/state", config.sensor_topic_base);
+    let state_topic =
+        SystemMonitor::create_topic(&config.sensor_topic_base, "system_performance", "state");
 
     for metric in SYSTEM_METRICS {
         let component_id = metric.json_field.to_string();

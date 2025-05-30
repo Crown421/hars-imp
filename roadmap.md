@@ -1,6 +1,7 @@
 Top Priority:
 - Build rpm (via cargo-rpm)
 - Change switch to also run exec command + "status", to give current status during discovery
+- Run suspend via dbus
 - Also add light/ dark mode switch?
 
 
@@ -11,14 +12,12 @@ High Priority:
     - More entity types: Support sensors, switches, binary sensors beyond buttons
     - Discovery cleanup: Remove stale discovery entries on shutdown
     - Entity icons and categories: Better Home Assistant UI integration
-- State publishing: Publish device state back to Home Assistant
-    - CPU and RAM usage via sysinfo
+- Start using https://github.com/MaxVerevkin/wl-gammarelay-rs/tree/main/src
+    - Use D-Bus to connect to HA as "light"
+- Fork "matcha", add a D-Bus interface? (matchad)
 
 Medium Priority:
-- Async command execution
-- Package as rpm
-- Deal with suspend/shutdown, via systemd
-- API from system
+- Option to disable dbus suspend/ shutdown/ ... via config
 
 
 Low Priority:
