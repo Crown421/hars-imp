@@ -4,8 +4,8 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::components::{
-    create_button_components_and_setup, create_switch_components_and_setup,
-    create_system_sensor_components, SystemMonitor,
+    create_button_components_and_setup, create_notification_components_and_setup,
+    create_switch_components_and_setup, create_system_sensor_components, SystemMonitor,
 };
 use crate::dbus::{create_status_component, StatusManager};
 use crate::utils::Config;
@@ -57,6 +57,14 @@ pub async fn initialize_mqtt_connection(
     for (command_topic, state_topic, exec_command) in switch_topics {
         topic_handlers.add_switch(command_topic, state_topic, exec_command);
     }
+
+    // Handle notification components and subscriptions
+    let (notification_components, notification_topic) =
+        create_notification_components_and_setup(&client, config).await?;
+    all_components.extend(notification_components);
+
+    // Add notification topic to unified handlers
+    topic_handlers.add_notification(notification_topic);
 
     // Create system monitoring sensor components
     let system_components = create_system_sensor_components(config);

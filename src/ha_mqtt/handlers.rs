@@ -12,6 +12,9 @@ pub enum TopicHandler {
         state_topic: String,
         exec_command: String,
     },
+    Notification {
+        topic: String,
+    },
 }
 
 /// Container for all topics that need to be handled
@@ -49,6 +52,10 @@ impl TopicHandlers {
             state_topic,
             exec_command,
         });
+    }
+
+    pub fn add_notification(&mut self, topic: String) {
+        self.handlers.push(TopicHandler::Notification { topic });
     }
 
     /// Handle an incoming MQTT message and return true if handled
@@ -123,7 +130,10 @@ impl TopicHandlers {
                                     client
                                         .publish(state_topic, QoS::AtLeastOnce, true, "")
                                         .await?;
-                                    debug!("Published empty state to topic '{}' due to command failure", state_topic);
+                                    debug!(
+                                        "Published empty state to topic '{}' due to command failure",
+                                        state_topic
+                                    );
                                 }
                             }
                             return Ok(true);
@@ -132,6 +142,33 @@ impl TopicHandlers {
                                 "Ignoring invalid switch payload '{}' on topic '{}'",
                                 payload, topic
                             );
+                        }
+                    }
+                }
+                TopicHandler::Notification {
+                    topic: notification_topic,
+                } => {
+                    if topic == notification_topic {
+                        debug!(
+                            "Processing notification command on topic '{}': {}",
+                            topic, payload
+                        );
+
+                        // Use the notification handler from the notifications module
+                        use crate::components::notifications::handle_notification_command;
+
+                        match handle_notification_command(topic, payload, notification_topic)
+                            .await
+                        {
+                            true => {
+                                info!("Notification processed successfully");
+                                return Ok(true);
+                            }
+                            false => {
+                                // This shouldn't happen since we already matched the topic,
+                                // but handle it gracefully
+                                debug!("Notification handler returned false for matched topic");
+                            }
                         }
                     }
                 }
@@ -150,6 +187,9 @@ impl TopicHandlers {
                 }
                 TopicHandler::Switch { command_topic, .. } => {
                     topics.push(command_topic.clone());
+                }
+                TopicHandler::Notification { topic, .. } => {
+                    topics.push(topic.clone());
                 }
             }
         }

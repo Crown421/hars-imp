@@ -46,6 +46,10 @@ pub enum ComponentType {
         #[serde(rename = "stat_t")]
         state_topic: String,
     },
+    Notify {
+        #[serde(rename = "cmd_t")]
+        command_topic: String,
+    },
 }
 
 /// A Home Assistant component with metadata
@@ -102,6 +106,15 @@ impl HomeAssistantComponent {
                 command_topic,
                 state_topic,
             },
+        }
+    }
+
+    /// Create a new notify component
+    pub fn notify(name: String, unique_id: String, command_topic: String) -> Self {
+        Self {
+            name,
+            unique_id,
+            component_type: ComponentType::Notify { command_topic },
         }
     }
 }
