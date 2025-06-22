@@ -19,7 +19,6 @@ impl NotificationPayload {
             Some("low") => 0,           // Low urgency
             Some("normal") | None => 1, // Normal urgency (default)
             Some("high") => 2,          // Critical urgency
-            Some("critical") => 2,      // Critical urgency
             _ => 1,                     // Default to normal for unknown values
         }
     }
