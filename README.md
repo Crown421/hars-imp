@@ -54,6 +54,11 @@ exec = "sudo apt update && sudo apt upgrade -y"
 [[switch]]
 name = "Test Switch"               # Switch name shown in Home Assistant
 exec = "echo Switch state:"        # Shell command to execute with "on" or "off" argument
+
+# Alternative: D-Bus switch
+[[switch]]
+name = "Idle inhibit"
+dbus = { service = "org.guayusa.IdleInhibitor", path = "/", interface = "org.guayusa.Idle", method = "SetInhibit" }
 ```
 
 ## Building and Running
@@ -92,12 +97,19 @@ The daemon will automatically handle the naming and topic generation.
 
 ### Switch Integration
 
-The daemon also supports Home Assistant switches that can be turned ON/OFF. Switch integration follows this flow:
+The daemon supports two types of switch actions:
+
+1. **Shell Command Switches**: Execute shell commands with "on" or "off" arguments
+2. **D-Bus Method Switches**: Call D-Bus methods with boolean true/false values
+
+Switch integration follows this flow:
 
 1. **Discovery**: The daemon publishes discovery messages to `homeassistant/switch/{hostname}_{switch_name}/config`
 2. **Switch Creation**: Home Assistant automatically creates switch entities
 3. **Switch Command**: When toggled in Home Assistant, it sends "ON" or "OFF" to `homeassistant/switch/{hostname}_{switch_name}/set`
-4. **Command Execution**: The daemon executes the configured shell command with "on" or "off" as an argument
+4. **Command Execution**: 
+   - For `exec` switches: The daemon executes the configured shell command with "on" or "off" as an argument
+   - For `dbus` switches: The daemon calls the specified D-Bus method with boolean `true` (for "ON") or `false` (for "OFF")
 5. **State Publishing**: If the command succeeds, the current state is published to the state topic. If it fails, an empty payload is published.
 
 #### Switch Topics

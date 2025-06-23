@@ -4,13 +4,13 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::components::{
-    create_button_components_and_setup, create_notification_components_and_setup,
-    create_switch_components_and_setup, create_system_sensor_components, SystemMonitor,
+    SystemMonitor, create_button_components_and_setup, create_notification_components_and_setup,
+    create_switch_components_and_setup, create_system_sensor_components,
 };
-use crate::dbus::{create_status_component, StatusManager};
+use crate::dbus::{StatusManager, create_status_component};
 use crate::utils::Config;
 
-use super::{publish_unified_discovery, TopicHandlers};
+use super::{TopicHandlers, publish_unified_discovery};
 
 pub async fn initialize_mqtt_connection(
     config: &Config,
@@ -54,8 +54,8 @@ pub async fn initialize_mqtt_connection(
     all_components.extend(switch_components);
 
     // Add switch topics to unified handlers
-    for (command_topic, state_topic, exec_command) in switch_topics {
-        topic_handlers.add_switch(command_topic, state_topic, exec_command);
+    for (command_topic, state_topic, action) in switch_topics {
+        topic_handlers.add_switch(command_topic, state_topic, action);
     }
 
     // Handle notification components and subscriptions

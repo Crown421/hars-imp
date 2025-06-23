@@ -1,7 +1,9 @@
-use crate::ha_mqtt::HomeAssistantComponent;
+use crate::ha_mqtt::{HomeAssistantComponent, handlers::SwitchAction};
 use crate::utils::Config;
+use crate::utils::config::DBusAction;
 use rumqttc::{AsyncClient, QoS};
 use tracing::{debug, error, info};
+use zbus::Connection;
 
 pub async fn execute_switch_command(
     command: &str,
@@ -100,7 +102,7 @@ pub async fn create_switch_components_and_setup(
 ) -> Result<
     (
         Vec<(String, HomeAssistantComponent)>,
-        Vec<(String, String, String)>,
+        Vec<(String, String, SwitchAction)>,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -133,9 +135,48 @@ pub async fn create_switch_components_and_setup(
             debug!("Subscribing to switch command topic: {}", command_topic);
             client.subscribe(&command_topic, QoS::AtMostOnce).await?;
 
-            switch_topics.push((command_topic, state_topic, switch.exec.clone()));
+            // Create the appropriate switch action based on configuration
+            let action = if let Some(exec_command) = &switch.exec {
+                SwitchAction::Exec(exec_command.clone())
+            } else if let Some(dbus_action) = &switch.dbus {
+                SwitchAction::DBus(dbus_action.clone())
+            } else {
+                return Err("Switch must have either 'exec' or 'dbus' action".into());
+            };
+
+            switch_topics.push((command_topic, state_topic, action));
         }
     }
 
     Ok((switch_components, switch_topics))
+}
+
+pub async fn execute_dbus_switch_command(
+    dbus_action: &DBusAction,
+    state: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    debug!(
+        "Executing D-Bus switch command: service={}, path={}, interface={}, method={}, state={}",
+        dbus_action.service, dbus_action.path, dbus_action.interface, dbus_action.method, state
+    );
+
+    let connection = Connection::session().await?;
+
+    // Send a simple method call directly without creating a proxy
+    // This is equivalent to: busctl --user call <service> <path> <interface> <method> b <state>
+    connection
+        .call_method(
+            Some(dbus_action.service.as_str()),
+            dbus_action.path.as_str(),
+            Some(dbus_action.interface.as_str()),
+            dbus_action.method.as_str(),
+            &(state,),
+        )
+        .await?;
+
+    debug!("D-Bus command executed successfully");
+    Ok(format!(
+        "D-Bus method call successful: {}.{} with boolean {}",
+        dbus_action.interface, dbus_action.method, state
+    ))
 }

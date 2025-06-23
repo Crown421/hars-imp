@@ -7,10 +7,19 @@ pub struct Button {
     pub exec: String,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct DBusAction {
+    pub service: String,
+    pub path: String,
+    pub interface: String,
+    pub method: String,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct Switch {
     pub name: String,
-    pub exec: String,
+    pub exec: Option<String>,
+    pub dbus: Option<DBusAction>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -59,6 +68,15 @@ impl Config {
         let contents = fs::read_to_string(path)?;
         let mut config: Config = toml::from_str(&contents)?;
 
+        // Validate switch configurations
+        if let Some(switches) = &config.switch {
+            for switch in switches {
+                switch
+                    .validate()
+                    .map_err(|e| format!("Configuration error: {}", e))?;
+            }
+        }
+
         // Set derived fields after parsing
         config.sensor_topic_base = format!("homeassistant/sensor/{}", config.hostname);
         config.button_topic = format!("homeassistant/button/{}", config.hostname);
@@ -66,4 +84,36 @@ impl Config {
 
         Ok(config)
     }
+}
+
+impl Switch {
+    /// Validates that exactly one action type (exec or dbus) is specified
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.exec, &self.dbus) {
+            (Some(_), Some(_)) => Err(format!(
+                "Switch '{}' cannot have both 'exec' and 'dbus' actions. Please specify only one.",
+                self.name
+            )),
+            (None, None) => Err(format!(
+                "Switch '{}' must have either 'exec' or 'dbus' action specified.",
+                self.name
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Returns the action type for this switch
+    pub fn action_type(&self) -> SwitchActionType {
+        if self.exec.is_some() {
+            SwitchActionType::Exec
+        } else {
+            SwitchActionType::DBus
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SwitchActionType {
+    Exec,
+    DBus,
 }

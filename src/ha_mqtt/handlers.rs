@@ -1,4 +1,11 @@
+use crate::utils::config::DBusAction;
 use rumqttc::{AsyncClient, QoS};
+
+#[derive(Debug, Clone)]
+pub enum SwitchAction {
+    Exec(String),
+    DBus(DBusAction),
+}
 
 /// Unified topic management for all component types
 #[derive(Debug, Clone)]
@@ -10,7 +17,7 @@ pub enum TopicHandler {
     Switch {
         command_topic: String,
         state_topic: String,
-        exec_command: String,
+        action: SwitchAction,
     },
     Notification {
         topic: String,
@@ -46,11 +53,11 @@ impl TopicHandlers {
         });
     }
 
-    pub fn add_switch(&mut self, command_topic: String, state_topic: String, exec_command: String) {
+    pub fn add_switch(&mut self, command_topic: String, state_topic: String, action: SwitchAction) {
         self.handlers.push(TopicHandler::Switch {
             command_topic,
             state_topic,
-            exec_command,
+            action,
         });
     }
 
@@ -66,7 +73,7 @@ impl TopicHandlers {
         client: &AsyncClient,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         use crate::components::buttons::execute_command;
-        use crate::components::switch::execute_switch_command;
+        use crate::components::switch::{execute_dbus_switch_command, execute_switch_command};
         use tracing::{debug, error, info};
 
         for handler in &self.handlers {
@@ -94,22 +101,28 @@ impl TopicHandlers {
                 TopicHandler::Switch {
                     command_topic,
                     state_topic,
-                    exec_command,
+                    action,
                 } => {
                     if topic == command_topic {
                         let payload = payload.trim();
                         if payload == "ON" || payload == "OFF" {
+                            let switch_state = payload == "ON";
                             info!(
-                                "Switch command received on topic '{}': {}, executing: {} {}",
-                                topic,
-                                payload,
-                                exec_command,
-                                payload.to_lowercase()
+                                "Switch command received on topic '{}': {}, executing action",
+                                topic, payload
                             );
 
-                            match execute_switch_command(exec_command, &payload.to_lowercase())
-                                .await
-                            {
+                            let execution_result = match action {
+                                SwitchAction::Exec(exec_command) => {
+                                    execute_switch_command(exec_command, &payload.to_lowercase())
+                                        .await
+                                }
+                                SwitchAction::DBus(dbus_action) => {
+                                    execute_dbus_switch_command(dbus_action, switch_state).await
+                                }
+                            };
+
+                            match execution_result {
                                 Ok(_output) => {
                                     info!("Switch command executed successfully");
                                     // Publish the new state to the state topic
@@ -122,10 +135,7 @@ impl TopicHandlers {
                                     );
                                 }
                                 Err(e) => {
-                                    error!(
-                                        "Failed to execute switch command '{}': {}",
-                                        exec_command, e
-                                    );
+                                    error!("Failed to execute switch command: {}", e);
                                     // Publish empty payload to indicate command failure
                                     client
                                         .publish(state_topic, QoS::AtLeastOnce, true, "")
@@ -157,8 +167,7 @@ impl TopicHandlers {
                         // Use the notification handler from the notifications module
                         use crate::components::notifications::handle_notification_command;
 
-                        match handle_notification_command(topic, payload, notification_topic)
-                            .await
+                        match handle_notification_command(topic, payload, notification_topic).await
                         {
                             true => {
                                 info!("Notification processed successfully");
