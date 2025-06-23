@@ -1,6 +1,10 @@
 # hars-imp
 
-A minimal and efficient Rust daemon for interacting with Home Assistant via MQTT
+This is my attempt at creating a rust-based MQTT client to connect my PC to home assistant. 
+I used [go-hass-agent](https://github.com/joshuar/go-hass-agent) at first, and while it is an extremely mature piece of software, it didn't quite fit my needs and wants. 
+
+Fair warning: This app is heavily vibe-coded, and while I have plans to rewrite a lot of it, I am not sure when. 
+For now it works for me, but I can't (yet at least) commit to any further improvements, in case anyone cares.
 
 ## Features
 
@@ -118,6 +122,13 @@ For a device with hostname `rust-daemon` and a switch named `Test Switch`:
 - **Discovery topic**: `homeassistant/switch/rust-daemon_test_switch/config`
 - **Command topic**: `homeassistant/switch/rust-daemon_test_switch/set`
 - **State topic**: `homeassistant/switch/rust-daemon_test_switch/state`
+
+### Notifications
+The app exposes a notifications component that forwards messages to the session dbus. In home assistant, use the `notify.send_message` action, and use a message like 
+```
+{"summary":"Hi","message":"Hello, hello, hello", "importance": "low"}
+```
+The importance can be omitted and defaults to `"normal"`. The other options are `"low"` and `"high"`. 
 
 ### System Monitoring Sensors
 
