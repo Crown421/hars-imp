@@ -295,7 +295,11 @@ pub fn create_system_sensor_components(config: &Config) -> Vec<(String, HomeAssi
         SystemMonitor::create_topic(&config.sensor_topic_base, "system_performance", "state");
 
     for metric in SYSTEM_METRICS {
-        let component_id = metric.json_field.to_string();
+        let component_id = format!(
+            "{}_{}",
+            config.hostname,
+            metric.json_field.replace(' ', "_").to_lowercase()
+        );
         let component = HomeAssistantComponent::sensor(
             metric.name.to_string(),
             component_id.clone(),
