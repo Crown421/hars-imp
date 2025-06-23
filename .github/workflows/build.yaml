@@ -1,8 +1,10 @@
 name: Build
 
 on:
+  workflow_dispatch:
   push:
     tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
   build_and_package:
@@ -15,16 +17,9 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Cache Cargo directories
-      uses: actions/cache@v4
+      uses: Swatinem/rust-cache@v2
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          target/ # Cache build target directory
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }} # Cache key
-        restore-keys: |
-          ${{ runner.os }}-cargo-
+        cache-on-failure: "true"
 
     - name: Build Rust binary
       run: cargo build --release --target x86_64-unknown-linux-gnu
@@ -34,5 +29,5 @@ jobs:
       if: github.ref_type == 'tag'
       with:
         files: |
-          target/release/hars-imp
+          target/x86_64-unknown-linux-gnu/release/hars-imp
 

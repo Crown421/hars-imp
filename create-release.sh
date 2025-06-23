@@ -2,7 +2,7 @@
 
 set -e
 
-VERSION=$(grep -m 1 "^version" Cargo.toml | sed -E 's/version\s*=\s*"([^"]*)"/\1/')
+VERSION=v$(grep -m 1 "^version" Cargo.toml | sed -E 's/version\s*=\s*"([^"]*)"/\1/')
 
 if [ -z "$VERSION" ]; then
     echo "Error: Could not determine version from Cargo.toml"
