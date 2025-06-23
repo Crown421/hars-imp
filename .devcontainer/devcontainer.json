@@ -1,5 +1,3 @@
-// For format details, see https://aka.ms/devcontainer.json. For config options, see the
-// README at: https://github.com/devcontainers/templates/tree/main/src/rust
 {
 	"name": "Rust",
 	"image": "mcr.microsoft.com/devcontainers/base:dev-debian",
@@ -12,7 +10,8 @@
 			"upgradePackages": "true",
 			"nonFreePackages": "true"
 		},
-		"ghcr.io/devcontainers/features/rust:1": {}
+		"ghcr.io/devcontainers/features/rust:1": {},
+		"ghcr.io/rio/features/chezmoi:1": {}
 	},
 	"customizations": {
 		"vscode": {
