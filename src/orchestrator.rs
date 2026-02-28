@@ -14,7 +14,7 @@ use crate::components::trait_def::{ActionMessage, Component};
 use crate::components::{button::ButtonComponent, switch::SwitchComponent};
 use crate::config::Config;
 use crate::dbus::power::{PowerEvent, PowerMonitor};
-use crate::mqtt::client::{MqttClient, MqttEvent, publish_retained, subscribe_topics};
+use crate::mqtt::client::{publish_retained, subscribe_topics, MqttClient, MqttEvent};
 use crate::mqtt::discovery::DeviceDiscoveryBuilder;
 
 /// The central coordinator that owns all components and runs the main event loop.
@@ -57,11 +57,9 @@ impl Orchestrator {
         let _mqtt_handle = tokio::spawn(mqtt_client.run(event_tx, action_rx));
 
         // --- Cancellation token for polling tasks ---
-        let polling_shutdown = CancellationToken::new();
-        let mut polling_handles = registry.spawn_polling_tasks(
-            action_tx.clone(),
-            polling_shutdown.clone(),
-        );
+        let mut polling_shutdown = CancellationToken::new();
+        let mut polling_handles =
+            registry.spawn_polling_tasks(action_tx.clone(), polling_shutdown.clone());
 
         // --- Main event loop ---
         info!("Entering main event loop");
@@ -73,7 +71,7 @@ impl Orchestrator {
                 &action_tx,
                 &mqtt_async_client,
                 &discovery_json,
-                &polling_shutdown,
+                &mut polling_shutdown,
                 &mut polling_handles,
             )
             .await;
@@ -83,23 +81,15 @@ impl Orchestrator {
         polling_shutdown.cancel();
 
         // Publish offline status.
-        if let Err(e) = publish_retained(
-            &mqtt_async_client,
-            &self.config.status_topic(),
-            "offline",
-        )
-        .await
+        if let Err(e) =
+            publish_retained(&mqtt_async_client, &self.config.status_topic(), "offline").await
         {
             warn!("Failed to publish offline status: {e}");
         }
 
         // Publish empty discovery to remove device from HA.
-        if let Err(e) = publish_retained(
-            &mqtt_async_client,
-            &self.config.discovery_topic(),
-            "",
-        )
-        .await
+        if let Err(e) =
+            publish_retained(&mqtt_async_client, &self.config.discovery_topic(), "").await
         {
             warn!("Failed to clear discovery: {e}");
         }
@@ -167,7 +157,8 @@ impl Orchestrator {
             .build();
 
         let json = serde_json::to_string(&discovery)
-            .map_err(crate::error::MqttError::Serialization)?;
+            .map_err(crate::error::MqttError::Serialization)
+            .map_err(Box::new)?;
 
         Ok(json)
     }
@@ -176,9 +167,7 @@ impl Orchestrator {
     ///
     /// If D-Bus is unavailable (e.g. in a container), logs a warning and
     /// returns a receiver that will never produce events.
-    async fn setup_power_monitor(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<PowerEvent> {
+    async fn setup_power_monitor(&self) -> tokio::sync::broadcast::Receiver<PowerEvent> {
         match crate::dbus::client::system_connection().await {
             Ok(conn) => match PowerMonitor::new(conn).await {
                 Ok((monitor, rx)) => {
@@ -215,7 +204,7 @@ impl Orchestrator {
         action_tx: &mpsc::Sender<ActionMessage>,
         mqtt_client: &rumqttc::AsyncClient,
         discovery_json: &str,
-        polling_shutdown: &CancellationToken,
+        polling_shutdown: &mut CancellationToken,
         polling_handles: &mut Vec<JoinHandle<()>>,
     ) -> Result<(), crate::error::AppError> {
         loop {
@@ -259,11 +248,13 @@ impl Orchestrator {
                         PowerEvent::Resuming => {
                             info!("Handling resume");
 
-                            // Restart polling tasks with a new token.
-                            let new_shutdown = polling_shutdown.child_token();
+                            // Create a fresh cancellation token — a child of a
+                            // cancelled token is immediately cancelled, so we
+                            // must replace the token entirely.
+                            *polling_shutdown = CancellationToken::new();
                             *polling_handles = registry.spawn_polling_tasks(
                                 action_tx.clone(),
-                                new_shutdown,
+                                polling_shutdown.clone(),
                             );
 
                             // Notify all components to re-publish state.
@@ -302,9 +293,7 @@ impl Orchestrator {
         }
 
         // Publish online status (retained).
-        if let Err(e) =
-            publish_retained(client, &self.config.status_topic(), "online").await
-        {
+        if let Err(e) = publish_retained(client, &self.config.status_topic(), "online").await {
             error!("Failed to publish online status: {e}");
         }
     }

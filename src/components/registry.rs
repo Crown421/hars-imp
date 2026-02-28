@@ -29,10 +29,7 @@ impl ComponentRegistry {
     pub fn register(&mut self, component: Arc<dyn Component>) {
         let idx = self.components.len();
         for topic in component.subscriptions() {
-            self.topic_map
-                .entry(topic)
-                .or_insert_with(Vec::new)
-                .push(idx);
+            self.topic_map.entry(topic).or_default().push(idx);
         }
         self.components.push(component);
     }

@@ -7,7 +7,7 @@ pub enum AppError {
     Config(#[from] ConfigError),
 
     #[error("MQTT error: {0}")]
-    Mqtt(#[from] MqttError),
+    Mqtt(#[from] Box<MqttError>),
 
     #[error("D-Bus error: {0}")]
     Dbus(#[from] DbusError),

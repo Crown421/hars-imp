@@ -78,15 +78,15 @@ This document tracks implementation status for the `take-2` rewrite. Each sectio
 
 | # | Severity | Location | Issue |
 |---|----------|----------|-------|
-| 1 | **High** | `orchestrator.rs` | **CancellationToken resume bug.** After `polling_shutdown.cancel()` on suspend, the `Resuming` arm creates `polling_shutdown.child_token()` — but a child of a cancelled token is immediately cancelled. Polling tasks never run after the first suspend/resume. Fix: create a fresh `CancellationToken` on resume. |
-| 2 | **Medium** | `dbus/power.rs` | **Sleep inhibitor FD dropped immediately.** `_reply: OwnedFd` goes out of scope at end of `acquire_inhibitor()`, releasing the lock. The FD must be stored (e.g. `Mutex<Option<OwnedFd>>` on `PowerMonitor`) and only dropped when suspending. |
+| 1 | ~~**High**~~ | `orchestrator.rs` | ~~**CancellationToken resume bug.** Fixed: `Resuming` arm now creates a fresh `CancellationToken` instead of using `child_token()` on the cancelled parent.~~ ✅ |
+| 2 | ~~**Medium**~~ | `dbus/power.rs` | ~~**Sleep inhibitor FD dropped immediately.** Fixed: FD is now stored in `Mutex<Option<OwnedFd>>` on `PowerMonitor` and explicitly released on suspend via `release_inhibitor()`.~~ ✅ |
 
 ## Known Future Work (Priority Order)
 
 ### P0 — Bug Fixes
-- [ ] Fix `CancellationToken` resume bug (see Known Bugs #1)
-- [ ] Fix sleep inhibitor FD lifetime (see Known Bugs #2)
-- [ ] Fix Clippy warnings: `.or_insert_with(Vec::new)` → `.or_default()` in registry; box large `AppError` variant
+- [x] Fix `CancellationToken` resume bug (see Known Bugs #1) — replaced `child_token()` with fresh `CancellationToken` on resume
+- [x] Fix sleep inhibitor FD lifetime (see Known Bugs #2) — stored in `Mutex<Option<OwnedFd>>`, released on suspend
+- [x] Fix Clippy warnings: `.or_insert_with(Vec::new)` → `.or_default()` in registry; boxed large `MqttError` variant in `AppError`
 
 ### P1 — Correctness & Robustness
 - [ ] Add SIGTERM handling (`tokio::signal::unix::signal(SignalKind::terminate())`) — critical for `systemd` service deployments

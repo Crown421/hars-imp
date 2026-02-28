@@ -1,8 +1,10 @@
+use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::StreamExt;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
+use zbus::zvariant::OwnedFd;
 use zbus::Connection;
 
 /// Events emitted by the power monitor.
@@ -22,6 +24,8 @@ pub enum PowerEvent {
 pub struct PowerMonitor {
     system_conn: Connection,
     power_tx: broadcast::Sender<PowerEvent>,
+    /// Held inhibitor FD. Dropping releases the lock.
+    inhibitor_fd: Mutex<Option<OwnedFd>>,
 }
 
 impl PowerMonitor {
@@ -37,6 +41,7 @@ impl PowerMonitor {
             Self {
                 system_conn,
                 power_tx,
+                inhibitor_fd: Mutex::new(None),
             },
             power_rx,
         ))
@@ -83,6 +88,9 @@ impl PowerMonitor {
             if suspending {
                 info!("System preparing to suspend");
                 let _ = self.power_tx.send(PowerEvent::Suspending);
+
+                // Release the inhibitor so the system can actually suspend.
+                self.release_inhibitor();
             } else {
                 info!("System resumed from suspend");
                 let _ = self.power_tx.send(PowerEvent::Resuming);
@@ -99,6 +107,9 @@ impl PowerMonitor {
     }
 
     /// Acquire a delay-mode sleep inhibitor from logind.
+    ///
+    /// The returned FD is stored in `self.inhibitor_fd`. The lock is held
+    /// until `release_inhibitor()` is called (or the monitor is dropped).
     async fn acquire_inhibitor(&self) -> Result<(), crate::error::DbusError> {
         let proxy: zbus::Proxy = zbus::proxy::Builder::new(&self.system_conn)
             .destination("org.freedesktop.login1")?
@@ -107,18 +118,37 @@ impl PowerMonitor {
             .build()
             .await?;
 
-        let _reply: zbus::zvariant::OwnedFd = proxy
-            .call("Inhibit", &("sleep", "hars-imp", "Publish status before sleep", "delay"))
+        let fd: OwnedFd = proxy
+            .call(
+                "Inhibit",
+                &("sleep", "hars-imp", "Publish status before sleep", "delay"),
+            )
             .await?;
+
+        // Store the FD so it stays alive until we explicitly release it.
+        if let Ok(mut guard) = self.inhibitor_fd.lock() {
+            *guard = Some(fd);
+        }
 
         info!("Acquired sleep inhibitor (delay mode)");
         Ok(())
+    }
+
+    /// Release the sleep inhibitor by dropping the stored FD.
+    fn release_inhibitor(&self) {
+        if let Ok(mut guard) = self.inhibitor_fd.lock() {
+            if guard.take().is_some() {
+                info!("Released sleep inhibitor");
+            }
+        }
     }
 }
 
 /// Attempt to reconnect to the system D-Bus with retries.
 #[allow(dead_code)]
-pub async fn reconnect_system_dbus(max_retries: u32) -> Result<Connection, crate::error::DbusError> {
+pub async fn reconnect_system_dbus(
+    max_retries: u32,
+) -> Result<Connection, crate::error::DbusError> {
     let mut attempt = 0;
     loop {
         attempt += 1;
