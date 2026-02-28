@@ -100,10 +100,9 @@ This document tracks implementation status for the `take-2` rewrite. Each sectio
 - [x] Extract polling boilerplate — `spawn_polling_task()` helper in `util/helpers.rs` encapsulates the `select!`/`sleep`/`send` loop; CPU and memory sensors now use it via a closure
 
 ### P3 — Feature Completion
-- [ ] Disk usage sensor (architecture lists it in `system_monitor.rs`)
+- [ ] Disk usage sensor (`system_monitor.rs` currently only has CPU and memory)
 - [ ] TLS support (`rumqttc` `Transport::Tls`) with optional config fields
 - [ ] Secret management (password not in plaintext config)
-- [ ] Discovery cleanup on shutdown (empty retained message) — ✅ already implemented, remove from backlog
 
 ### P4 — Testing
 - [ ] Unit tests — config parsing/validation, `ComponentRegistry` routing, `handle_message` with known payloads, `slugify` edge cases, discovery JSON serialization round-trip

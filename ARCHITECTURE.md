@@ -37,12 +37,12 @@ src/
 │   ├── registry.rs             # ComponentRegistry: topic→component routing
 │   ├── button.rs               # ButtonComponent (config-driven, shell exec on PRESS)
 │   ├── switch.rs               # SwitchComponent (shell exec or D-Bus method call)
-│   ├── sensor.rs               # SensorComponent (base for polled sensors)
-│   ├── system_monitor.rs       # CPU, RAM, disk sensors via sysinfo
+│   ├── system_monitor.rs       # CPU, RAM sensors via sysinfo
 │   └── notification.rs         # NotificationComponent (MQTT JSON → D-Bus notify)
 │
 └── util/
     ├── mod.rs                  # Re-exports
+    ├── helpers.rs              # slugify(), execute_command(), spawn_polling_task()
     ├── logging.rs              # tracing-subscriber initialization
     └── version.rs              # Compile-time version info
 ```
@@ -93,7 +93,7 @@ pub trait Component: Send + Sync {
 │  Components  │ ───────────► │ Orchestrator  │ ─────────► │  MQTT Broker │
 │  (sensors,   │              │  (main loop)  │            │              │
 │   handlers)  │ ◄─────────── │               │ ◄───────── │              │
-└──────────────┘  event_tx    └──────────────┘  subscribe  └──────────────┘
+└──────────────┘  MqttEvent   └──────────────┘  subscribe  └──────────────┘
                                      ▲
                                      │ power_rx
                               ┌──────────────┐
@@ -103,7 +103,7 @@ pub trait Component: Send + Sync {
 ```
 
 - **ActionMessage** `(String, String)` — (topic, payload) for outbound MQTT. Components send these.
-- **EventMessage** `(String, String)` — (topic, payload) for inbound MQTT. Orchestrator routes to components.
+- **MqttEvent** `{Connected, Message(String, String), Disconnected(String)}` — inbound MQTT events. Orchestrator routes `Message` variants to components.
 - **PowerEvent** `{Suspending, Resuming}` — broadcast from D-Bus power monitor.
 
 ### Orchestrator (`orchestrator.rs`)
