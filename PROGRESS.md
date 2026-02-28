@@ -89,10 +89,10 @@ This document tracks implementation status for the `take-2` rewrite. Each sectio
 - [x] Fix Clippy warnings: `.or_insert_with(Vec::new)` → `.or_default()` in registry; boxed large `MqttError` variant in `AppError`
 
 ### P1 — Correctness & Robustness
-- [ ] Add SIGTERM handling (`tokio::signal::unix::signal(SignalKind::terminate())`) — critical for `systemd` service deployments
-- [ ] Cache D-Bus session connection — `notification.rs` and `switch.rs` open a fresh `Connection::session()` on every call; share one connection
-- [ ] Command execution timeouts
-- [ ] Switch state query on startup
+- [x] Add SIGTERM handling (`tokio::signal::unix::signal(SignalKind::terminate())`) — added SIGTERM arm to `select!` loop alongside SIGINT
+- [x] Cache D-Bus session connection — shared `OnceCell<Connection>` in `dbus/client.rs`; `notification.rs` and `switch.rs` now use cached connection
+- [x] Command execution timeouts — `execute_command()` in `button.rs` now enforces a 30-second timeout via `tokio::time::timeout`
+- [x] Switch state query on startup — `on_mqtt_connected()` now calls `notify_resume()` to publish initial component states (including switch OFF)
 
 ### P2 — Code Quality & Refactoring
 - [ ] Move `slugify()` and `execute_command()` out of `button.rs` into `util/` — both are shared by `switch.rs` and `orchestrator.rs`

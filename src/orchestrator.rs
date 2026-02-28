@@ -207,6 +207,10 @@ impl Orchestrator {
         polling_shutdown: &mut CancellationToken,
         polling_handles: &mut Vec<JoinHandle<()>>,
     ) -> Result<(), crate::error::AppError> {
+        // Set up SIGTERM handler for systemd service deployments.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
+
         loop {
             tokio::select! {
                 // --- MQTT events ---
@@ -218,6 +222,7 @@ impl Orchestrator {
                                 mqtt_client,
                                 registry,
                                 discovery_json,
+                                action_tx,
                             ).await;
                         }
                         MqttEvent::Message(topic, payload) => {
@@ -268,16 +273,22 @@ impl Orchestrator {
                     info!("Received SIGINT, shutting down");
                     return Ok(());
                 }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, shutting down");
+                    return Ok(());
+                }
             }
         }
     }
 
-    /// Called when MQTT connects/reconnects: publish discovery, subscribe, publish online.
+    /// Called when MQTT connects/reconnects: publish discovery, subscribe, publish online,
+    /// and publish current component states.
     async fn on_mqtt_connected(
         &self,
         client: &rumqttc::AsyncClient,
         registry: &ComponentRegistry,
         discovery_json: &str,
+        action_tx: &mpsc::Sender<ActionMessage>,
     ) {
         // Publish discovery (retained).
         if let Err(e) =
@@ -296,5 +307,8 @@ impl Orchestrator {
         if let Err(e) = publish_retained(client, &self.config.status_topic(), "online").await {
             error!("Failed to publish online status: {e}");
         }
+
+        // Publish current state for all stateful components (e.g. switches).
+        registry.notify_resume(action_tx).await;
     }
 }

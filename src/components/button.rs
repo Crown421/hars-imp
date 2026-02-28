@@ -87,13 +87,31 @@ impl Component for ButtonComponent {
 }
 
 /// Execute a shell command asynchronously and return stdout.
+///
+/// Commands are killed if they do not complete within 30 seconds.
 pub async fn execute_command(cmd: &str) -> Result<String, crate::error::ComponentError> {
-    let output = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output()
-        .await
-        .map_err(|e| crate::error::ComponentError::CommandFailed(e.to_string()))?;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let result = tokio::time::timeout(
+        TIMEOUT,
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output(),
+    )
+    .await;
+
+    let output = match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return Err(crate::error::ComponentError::CommandFailed(e.to_string()));
+        }
+        Err(_) => {
+            return Err(crate::error::ComponentError::CommandFailed(format!(
+                "Command timed out after {TIMEOUT:?}: {cmd}"
+            )));
+        }
+    };
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())

@@ -151,9 +151,9 @@ async fn execute_dbus_switch(
     config: &DbusActionConfig,
     state: bool,
 ) -> Result<(), crate::error::DbusError> {
-    let conn = zbus::Connection::session().await?;
+    let conn = crate::dbus::client::session_connection().await?;
 
-    let proxy: zbus::Proxy = zbus::proxy::Builder::new(&conn)
+    let proxy: zbus::Proxy = zbus::proxy::Builder::new(conn)
         .destination(config.service.as_str())?
         .path(config.path.as_str())?
         .interface(config.interface.as_str())?

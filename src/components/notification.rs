@@ -92,10 +92,10 @@ impl Component for NotificationComponent {
         };
 
         // Try to send the desktop notification via session D-Bus.
-        match zbus::Connection::session().await {
+        match crate::dbus::client::session_connection().await {
             Ok(conn) => {
                 if let Err(e) = dbus_notify::send_notification(
-                    &conn,
+                    conn,
                     &notification.summary,
                     &notification.message,
                     urgency,
