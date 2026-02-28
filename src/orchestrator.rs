@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 
 use crate::components::notification::NotificationComponent;
 use crate::components::registry::ComponentRegistry;
-use crate::components::system_monitor::{CpuSensor, MemorySensor};
+use crate::components::system_monitor::{CpuSensor, DiskUsageSensor, MemorySensor};
 use crate::components::trait_def::{ActionMessage, Component};
 use crate::components::{button::ButtonComponent, switch::SwitchComponent};
 use crate::config::Config;
@@ -44,7 +44,7 @@ impl Orchestrator {
         let (event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(100);
 
         // --- Create MQTT client ---
-        let mqtt_client = MqttClient::new(&self.config);
+        let mqtt_client = MqttClient::new(&self.config).map_err(Box::new)?;
         let mqtt_async_client = mqtt_client.client();
 
         // --- Set up D-Bus power monitoring ---
@@ -134,6 +134,15 @@ impl Orchestrator {
         info!("Registering CPU and memory sensors");
         registry.register(cpu);
         registry.register(memory);
+
+        // Built-in disk usage sensor (root partition)
+        let disk = Arc::new(DiskUsageSensor::new(
+            &self.config.hostname,
+            self.config.update_interval_secs,
+            None, // defaults to "/"
+        ));
+        info!("Registering disk usage sensor");
+        registry.register(disk);
     }
 
     /// Build the HA device discovery JSON payload.

@@ -40,6 +40,9 @@ pub enum MqttError {
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("TLS configuration error: {0}")]
+    Tls(String),
 }
 
 /// Errors related to D-Bus operations.

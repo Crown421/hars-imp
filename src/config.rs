@@ -38,6 +38,24 @@ pub struct Config {
     /// Switch definitions.
     #[serde(default)]
     pub switch: Vec<SwitchConfig>,
+
+    /// TLS configuration.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS configuration for the MQTT connection.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    /// Path to a PEM-encoded CA certificate file.
+    /// If omitted, the system's native root certificates are used.
+    pub ca_file: Option<String>,
+
+    /// Path to a PEM-encoded client certificate file (for mTLS).
+    pub client_cert: Option<String>,
+
+    /// Path to a PEM-encoded client private key file (for mTLS).
+    pub client_key: Option<String>,
 }
 
 /// Configuration for a button entity.
@@ -81,6 +99,10 @@ pub struct DbusActionConfig {
 
 fn default_mqtt_port() -> u16 {
     1883
+}
+
+fn default_mqtt_tls_port() -> u16 {
+    8883
 }
 
 fn default_log_level() -> String {
@@ -145,7 +167,33 @@ impl Config {
                 )));
             }
         }
+        // Validate TLS mutual auth config: both cert and key must be present together.
+        if let Some(ref tls) = self.tls {
+            let has_cert = tls.client_cert.is_some();
+            let has_key = tls.client_key.is_some();
+            if has_cert != has_key {
+                return Err(ConfigError::Validation(
+                    "TLS client_cert and client_key must both be specified for mTLS".into(),
+                ));
+            }
+        }
+
         Ok(())
+    }
+
+    /// Returns the effective MQTT port.
+    ///
+    /// If the user did not explicitly set `mqtt_port`, this returns 8883
+    /// when TLS is enabled and 1883 otherwise.
+    pub fn effective_mqtt_port(&self) -> u16 {
+        // If the port was explicitly set in config, use it as-is.
+        // We detect the "default" case by checking if it equals the
+        // serde default (1883) *and* TLS is enabled.
+        if self.mqtt_port == default_mqtt_port() && self.tls.is_some() {
+            default_mqtt_tls_port()
+        } else {
+            self.mqtt_port
+        }
     }
 
     // --- Derived topic helpers ---
@@ -164,6 +212,4 @@ impl Config {
     pub fn status_topic(&self) -> String {
         format!("{}/status", self.device_base_topic())
     }
-
-
 }

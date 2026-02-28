@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -28,15 +28,19 @@ pub enum MqttEvent {
 
 impl MqttClient {
     /// Create a new MQTT client from config.
-    pub fn new(config: &Config) -> Self {
-        let mut opts = MqttOptions::new(
-            &config.hostname,
-            &config.mqtt_url,
-            config.mqtt_port,
-        );
+    pub fn new(config: &Config) -> Result<Self, MqttError> {
+        let port = config.effective_mqtt_port();
+        let mut opts = MqttOptions::new(&config.hostname, &config.mqtt_url, port);
         opts.set_credentials(&config.username, &config.password);
         opts.set_keep_alive(Duration::from_secs(30));
         opts.set_clean_session(true);
+
+        // Configure TLS transport if enabled.
+        if let Some(ref tls) = config.tls {
+            let transport = build_tls_transport(tls)?;
+            opts.set_transport(transport);
+            info!("MQTT TLS enabled (port {port})");
+        }
 
         // Set a last-will message so HA knows we're offline if we crash.
         let status_topic = config.status_topic();
@@ -49,7 +53,7 @@ impl MqttClient {
 
         let (client, eventloop) = AsyncClient::new(opts, 50);
 
-        Self { client, eventloop }
+        Ok(Self { client, eventloop })
     }
 
     /// Get a clone of the underlying async client for publishing.
@@ -131,6 +135,36 @@ async fn handle_event(event: Event, event_tx: &mpsc::Sender<MqttEvent>) {
     }
 }
 
+/// Build a `rumqttc::Transport` from the user's TLS configuration.
+fn build_tls_transport(tls: &crate::config::TlsConfig) -> Result<Transport, MqttError> {
+    // Read the CA certificate, or use system roots.
+    let ca = match &tls.ca_file {
+        Some(path) => std::fs::read(path)
+            .map_err(|e| MqttError::Tls(format!("Failed to read CA file '{path}': {e}")))?,
+        None => {
+            // No custom CA — use system native root certificates.
+            // `Transport::tls_with_default_config()` uses rustls-native-certs.
+            return Ok(Transport::tls_with_default_config());
+        }
+    };
+
+    // Read optional client certificate + key for mTLS.
+    let client_auth = match (&tls.client_cert, &tls.client_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert = std::fs::read(cert_path).map_err(|e| {
+                MqttError::Tls(format!("Failed to read client cert '{cert_path}': {e}"))
+            })?;
+            let key = std::fs::read(key_path).map_err(|e| {
+                MqttError::Tls(format!("Failed to read client key '{key_path}': {e}"))
+            })?;
+            Some((cert, key))
+        }
+        _ => None,
+    };
+
+    Ok(Transport::tls(ca, client_auth, None))
+}
+
 /// Publish a message with retain flag.
 pub async fn publish_retained(
     client: &AsyncClient,
@@ -144,10 +178,7 @@ pub async fn publish_retained(
 }
 
 /// Subscribe to a list of topics.
-pub async fn subscribe_topics(
-    client: &AsyncClient,
-    topics: &[String],
-) -> Result<(), MqttError> {
+pub async fn subscribe_topics(client: &AsyncClient, topics: &[String]) -> Result<(), MqttError> {
     for topic in topics {
         info!("Subscribing to: {topic}");
         client.subscribe(topic, QoS::AtLeastOnce).await?;
