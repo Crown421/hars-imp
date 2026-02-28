@@ -6,10 +6,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::components::button::{execute_command, slugify};
 use crate::components::trait_def::{ActionMessage, Component};
 use crate::config::{DbusActionConfig, SwitchConfig};
 use crate::mqtt::discovery::{ComponentType, HomeAssistantComponent};
+use crate::util::helpers::{execute_command, slugify};
 
 /// The action a switch performs: either a shell command or a D-Bus method call.
 #[derive(Debug, Clone)]

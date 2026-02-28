@@ -95,9 +95,9 @@ This document tracks implementation status for the `take-2` rewrite. Each sectio
 - [x] Switch state query on startup — `on_mqtt_connected()` now calls `notify_resume()` to publish initial component states (including switch OFF)
 
 ### P2 — Code Quality & Refactoring
-- [ ] Move `slugify()` and `execute_command()` out of `button.rs` into `util/` — both are shared by `switch.rs` and `orchestrator.rs`
-- [ ] Remove or use `#[allow(dead_code)]` topic helpers on `Config` (`sensor_topic_base`, `button_topic_base`, etc.) — components build topics themselves, so these are stale
-- [ ] Extract polling boilerplate — CPU and memory sensors duplicate the `select!`/`sleep` pattern; consider a base type or macro
+- [x] Move `slugify()` and `execute_command()` out of `button.rs` into `util/helpers.rs` — both are now shared by `button.rs`, `switch.rs`, and `orchestrator.rs`
+- [x] Remove stale topic helpers on `Config` (`sensor_topic_base`, `button_topic_base`, `switch_topic_base`, `notify_topic`) — components build topics themselves, so these were unused dead code
+- [x] Extract polling boilerplate — `spawn_polling_task()` helper in `util/helpers.rs` encapsulates the `select!`/`sleep`/`send` loop; CPU and memory sensors now use it via a closure
 
 ### P3 — Feature Completion
 - [ ] Disk usage sensor (architecture lists it in `system_monitor.rs`)

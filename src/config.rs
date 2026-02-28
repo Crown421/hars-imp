@@ -165,27 +165,5 @@ impl Config {
         format!("{}/status", self.device_base_topic())
     }
 
-    /// Sensor state topic base: `homeassistant/sensor/{hostname}`
-    #[allow(dead_code)]
-    pub fn sensor_topic_base(&self) -> String {
-        format!("homeassistant/sensor/{}", self.hostname)
-    }
 
-    /// Button command topic base: `homeassistant/button/{hostname}`
-    #[allow(dead_code)]
-    pub fn button_topic_base(&self) -> String {
-        format!("homeassistant/button/{}", self.hostname)
-    }
-
-    /// Switch command topic base: `homeassistant/switch/{hostname}`
-    #[allow(dead_code)]
-    pub fn switch_topic_base(&self) -> String {
-        format!("homeassistant/switch/{}", self.hostname)
-    }
-
-    /// Notification command topic: `homeassistant/notify/{hostname}`
-    #[allow(dead_code)]
-    pub fn notify_topic(&self) -> String {
-        format!("homeassistant/notify/{}", self.hostname)
-    }
 }

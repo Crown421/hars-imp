@@ -6,10 +6,10 @@ use sysinfo::System;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
 
 use crate::components::trait_def::{ActionMessage, Component};
 use crate::mqtt::discovery::{ComponentType, HomeAssistantComponent};
+use crate::util::helpers::spawn_polling_task;
 
 /// CPU usage sensor.
 pub struct CpuSensor {
@@ -68,36 +68,26 @@ impl Component for CpuSensor {
         action_tx: mpsc::Sender<ActionMessage>,
         shutdown: CancellationToken,
     ) -> Option<JoinHandle<()>> {
-        Some(tokio::spawn(async move {
-            let mut sys = System::new();
+        let interval = self.update_interval;
+        let state_topic = self.state_topic.clone();
 
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        debug!("CPU sensor polling task shutting down");
-                        return;
-                    }
-                    _ = tokio::time::sleep(self.update_interval) => {
-                        // Refresh CPU usage (needs two calls with a delay).
-                        sys.refresh_cpu_usage();
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        sys.refresh_cpu_usage();
+        // Prime the CPU measurement — the first refresh establishes a baseline
+        // so subsequent single calls return meaningful deltas.
+        let mut sys = System::new();
+        sys.refresh_cpu_usage();
 
-                        let cpu_usage = sys.global_cpu_usage();
-                        let payload = format!("{cpu_usage:.1}");
-                        debug!("CPU usage: {payload}%");
-
-                        if let Err(e) = action_tx
-                            .send((self.state_topic.clone(), payload))
-                            .await
-                        {
-                            error!("Failed to send CPU usage: {e}");
-                            return;
-                        }
-                    }
-                }
-            }
-        }))
+        Some(spawn_polling_task(
+            "CPU sensor",
+            state_topic,
+            interval,
+            sys,
+            shutdown,
+            action_tx,
+            |sys| {
+                sys.refresh_cpu_usage();
+                format!("{:.1}", sys.global_cpu_usage())
+            },
+        ))
     }
 
     async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {
@@ -160,35 +150,24 @@ impl Component for MemorySensor {
         action_tx: mpsc::Sender<ActionMessage>,
         shutdown: CancellationToken,
     ) -> Option<JoinHandle<()>> {
-        Some(tokio::spawn(async move {
-            let mut sys = System::new();
+        let interval = self.update_interval;
+        let state_topic = self.state_topic.clone();
 
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        debug!("Memory sensor polling task shutting down");
-                        return;
-                    }
-                    _ = tokio::time::sleep(self.update_interval) => {
-                        sys.refresh_memory();
-
-                        let total = sys.total_memory() as f64;
-                        let used = sys.used_memory() as f64;
-                        let usage_pct = if total > 0.0 { (used / total) * 100.0 } else { 0.0 };
-                        let payload = format!("{usage_pct:.1}");
-                        debug!("Memory usage: {payload}%");
-
-                        if let Err(e) = action_tx
-                            .send((self.state_topic.clone(), payload))
-                            .await
-                        {
-                            error!("Failed to send memory usage: {e}");
-                            return;
-                        }
-                    }
-                }
-            }
-        }))
+        Some(spawn_polling_task(
+            "Memory sensor",
+            state_topic,
+            interval,
+            System::new(),
+            shutdown,
+            action_tx,
+            |sys| {
+                sys.refresh_memory();
+                let total = sys.total_memory() as f64;
+                let used = sys.used_memory() as f64;
+                let usage_pct = if total > 0.0 { (used / total) * 100.0 } else { 0.0 };
+                format!("{usage_pct:.1}")
+            },
+        ))
     }
 
     async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}

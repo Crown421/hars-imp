@@ -9,6 +9,7 @@ use tracing::{error, info};
 use crate::components::trait_def::{ActionMessage, Component};
 use crate::config::ButtonConfig;
 use crate::mqtt::discovery::{ComponentType, HomeAssistantComponent};
+use crate::util::helpers::{execute_command, slugify};
 
 /// A button entity that executes a shell command when pressed.
 pub struct ButtonComponent {
@@ -84,47 +85,4 @@ impl Component for ButtonComponent {
     async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {
         // Buttons have no state to re-publish.
     }
-}
-
-/// Execute a shell command asynchronously and return stdout.
-///
-/// Commands are killed if they do not complete within 30 seconds.
-pub async fn execute_command(cmd: &str) -> Result<String, crate::error::ComponentError> {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-    let result = tokio::time::timeout(
-        TIMEOUT,
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .output(),
-    )
-    .await;
-
-    let output = match result {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            return Err(crate::error::ComponentError::CommandFailed(e.to_string()));
-        }
-        Err(_) => {
-            return Err(crate::error::ComponentError::CommandFailed(format!(
-                "Command timed out after {TIMEOUT:?}: {cmd}"
-            )));
-        }
-    };
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(crate::error::ComponentError::CommandFailed(stderr))
-    }
-}
-
-/// Convert a name to a URL/topic-safe slug.
-pub fn slugify(name: &str) -> String {
-    name.to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric(), "_")
-        .trim_matches('_')
-        .to_string()
 }

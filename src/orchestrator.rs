@@ -6,7 +6,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::components::button::slugify;
 use crate::components::notification::NotificationComponent;
 use crate::components::registry::ComponentRegistry;
 use crate::components::system_monitor::{CpuSensor, MemorySensor};
@@ -16,6 +15,7 @@ use crate::config::Config;
 use crate::dbus::power::{PowerEvent, PowerMonitor};
 use crate::mqtt::client::{publish_retained, subscribe_topics, MqttClient, MqttEvent};
 use crate::mqtt::discovery::DeviceDiscoveryBuilder;
+use crate::util::helpers::slugify;
 
 /// The central coordinator that owns all components and runs the main event loop.
 pub struct Orchestrator {
