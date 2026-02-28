@@ -1,0 +1,111 @@
+# hars-imp — Implementation Progress
+
+This document tracks implementation status for the `take-2` rewrite. Each section corresponds to a module or concern. Future agents should update this file as work progresses.
+
+## Status Legend
+
+- ✅ Complete — code written, compiles, basic functionality verified
+- 🔧 In Progress — partially implemented
+- ⬜ Not Started
+- 🔲 Blocked — waiting on dependency
+
+---
+
+## Phase 1: Project Scaffold & Core Types
+
+| Item | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| `Cargo.toml` | ✅ | `Cargo.toml` | All dependencies declared |
+| Error types | ✅ | `src/error.rs` | `thiserror`-based: Config, Mqtt, Dbus, Component variants |
+| Config loading | ✅ | `src/config.rs` | TOML parsing, derived fields, debug/release paths |
+| Component trait | ✅ | `src/components/trait_def.rs` | `async_trait`, ActionMessage, all methods defined |
+| Component registry | ✅ | `src/components/registry.rs` | HashMap-based topic→component routing |
+| Util modules | ✅ | `src/util/` | logging.rs, version.rs |
+| Main entry point | ✅ | `src/main.rs` | Loads config, inits logging, runs orchestrator |
+
+## Phase 2: MQTT Layer
+
+| Item | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| Discovery types | ✅ | `src/mqtt/discovery.rs` | `HomeAssistantComponent`, `ComponentType`, `DeviceDiscovery`, builder |
+| MQTT client | ✅ | `src/mqtt/client.rs` | Connect, publish, subscribe; reconnect on `ConnAck` |
+
+## Phase 3: D-Bus Layer
+
+| Item | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| D-Bus client factory | ✅ | `src/dbus/client.rs` | Shared `zbus::Connection` creation |
+| Power monitor | ✅ | `src/dbus/power.rs` | `PrepareForSleep` signal listener, inhibitor acquire/release, broadcast channel |
+| Notification sender | ✅ | `src/dbus/notifications.rs` | Desktop notifications via `org.freedesktop.Notifications` |
+
+## Phase 4: Component Implementations
+
+| Item | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| ButtonComponent | ✅ | `src/components/button.rs` | Shell exec on `PRESS`, config-driven |
+| SwitchComponent | ✅ | `src/components/switch.rs` | Shell exec or D-Bus method, state tracking |
+| SystemMonitor | ✅ | `src/components/system_monitor.rs` | CPU, memory via sysinfo, polled |
+| NotificationComponent | ✅ | `src/components/notification.rs` | MQTT JSON → D-Bus desktop notification |
+
+## Phase 5: Orchestrator & Integration
+
+| Item | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| Orchestrator | ✅ | `src/orchestrator.rs` | Main select! loop, component lifecycle, suspend/resume |
+
+## Phase 6: Compilation & Testing
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `cargo check` passes | ✅ | Zero warnings, all modules compile |
+| `cargo build` passes | ✅ | Full debug build succeeds |
+| Manual testing | ⬜ | Requires MQTT broker + HA instance |
+| Unit tests | ⬜ | Future work |
+
+---
+
+## Architecture Decisions Made
+
+1. **`&self` on `handle_message`** — Interior mutability (`Arc<Mutex<>>`) only where needed (switch state). Keeps trait object-safe.
+2. **`CancellationToken`** over `AbortHandle` — Cooperative cancellation for polling tasks allows cleanup.
+3. **`HashMap<String, Vec<Arc<dyn Component>>>`** for topic routing — O(1) lookup instead of linear scan.
+4. **Single discovery message** — HA Device Discovery v2 format; one retained message for all entities.
+5. **Explicit re-subscribe on ConnAck** — `clean_session = true`, we always re-subscribe rather than relying on broker state.
+6. **Exponential backoff on MQTT errors** — 1s → 60s cap, reset on success.
+7. **`thiserror` for module errors** — Typed errors for programmatic handling; no `Box<dyn Error>`.
+
+## Known Bugs
+
+| # | Severity | Location | Issue |
+|---|----------|----------|-------|
+| 1 | **High** | `orchestrator.rs` | **CancellationToken resume bug.** After `polling_shutdown.cancel()` on suspend, the `Resuming` arm creates `polling_shutdown.child_token()` — but a child of a cancelled token is immediately cancelled. Polling tasks never run after the first suspend/resume. Fix: create a fresh `CancellationToken` on resume. |
+| 2 | **Medium** | `dbus/power.rs` | **Sleep inhibitor FD dropped immediately.** `_reply: OwnedFd` goes out of scope at end of `acquire_inhibitor()`, releasing the lock. The FD must be stored (e.g. `Mutex<Option<OwnedFd>>` on `PowerMonitor`) and only dropped when suspending. |
+
+## Known Future Work (Priority Order)
+
+### P0 — Bug Fixes
+- [ ] Fix `CancellationToken` resume bug (see Known Bugs #1)
+- [ ] Fix sleep inhibitor FD lifetime (see Known Bugs #2)
+- [ ] Fix Clippy warnings: `.or_insert_with(Vec::new)` → `.or_default()` in registry; box large `AppError` variant
+
+### P1 — Correctness & Robustness
+- [ ] Add SIGTERM handling (`tokio::signal::unix::signal(SignalKind::terminate())`) — critical for `systemd` service deployments
+- [ ] Cache D-Bus session connection — `notification.rs` and `switch.rs` open a fresh `Connection::session()` on every call; share one connection
+- [ ] Command execution timeouts
+- [ ] Switch state query on startup
+
+### P2 — Code Quality & Refactoring
+- [ ] Move `slugify()` and `execute_command()` out of `button.rs` into `util/` — both are shared by `switch.rs` and `orchestrator.rs`
+- [ ] Remove or use `#[allow(dead_code)]` topic helpers on `Config` (`sensor_topic_base`, `button_topic_base`, etc.) — components build topics themselves, so these are stale
+- [ ] Extract polling boilerplate — CPU and memory sensors duplicate the `select!`/`sleep` pattern; consider a base type or macro
+
+### P3 — Feature Completion
+- [ ] Disk usage sensor (architecture lists it in `system_monitor.rs`)
+- [ ] TLS support (`rumqttc` `Transport::Tls`) with optional config fields
+- [ ] Secret management (password not in plaintext config)
+- [ ] Discovery cleanup on shutdown (empty retained message) — ✅ already implemented, remove from backlog
+
+### P4 — Testing
+- [ ] Unit tests — config parsing/validation, `ComponentRegistry` routing, `handle_message` with known payloads, `slugify` edge cases, discovery JSON serialization round-trip
+- [ ] Integration tests with mock MQTT broker (e.g. `mosquitto` in Docker)
+- [ ] Manual testing — requires MQTT broker + HA instance
