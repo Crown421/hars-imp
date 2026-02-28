@@ -105,6 +105,6 @@ This document tracks implementation status for the `take-2` rewrite. Each sectio
 - [ ] Secret management (password not in plaintext config) — options proposed, awaiting decision
 
 ### P4 — Testing
-- [ ] Unit tests — config parsing/validation, `ComponentRegistry` routing, `handle_message` with known payloads, `slugify` edge cases, discovery JSON serialization round-trip
+- [x] Unit tests — config parsing/validation, `ComponentRegistry` routing, `handle_message` with known payloads, `slugify` edge cases, discovery JSON serialization round-trip (63 tests across 6 modules)
 - [ ] Integration tests with mock MQTT broker (e.g. `mosquitto` in Docker)
 - [ ] Manual testing — requires MQTT broker + HA instance

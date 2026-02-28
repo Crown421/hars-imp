@@ -94,3 +94,70 @@ where
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugify_basic() {
+        assert_eq!(slugify("Hello World"), "hello_world");
+    }
+
+    #[test]
+    fn slugify_special_characters() {
+        assert_eq!(slugify("CPU (%) Usage!"), "cpu_____usage");
+    }
+
+    #[test]
+    fn slugify_already_slug() {
+        assert_eq!(slugify("already_slug"), "already_slug");
+    }
+
+    #[test]
+    fn slugify_uppercase() {
+        assert_eq!(slugify("ALL_UPPER"), "all_upper");
+    }
+
+    #[test]
+    fn slugify_leading_trailing_special() {
+        // Leading and trailing non-alphanumeric chars become underscores, then trimmed
+        assert_eq!(slugify("--test--"), "test");
+        assert_eq!(slugify("  spaced  "), "spaced");
+    }
+
+    #[test]
+    fn slugify_empty_string() {
+        assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn slugify_numbers() {
+        assert_eq!(slugify("Sensor 42"), "sensor_42");
+    }
+
+    #[test]
+    fn slugify_consecutive_special() {
+        // Multiple consecutive special chars all become underscores
+        assert_eq!(slugify("a---b"), "a___b");
+    }
+
+    #[test]
+    fn slugify_single_char() {
+        assert_eq!(slugify("X"), "x");
+        assert_eq!(slugify("-"), "");
+    }
+
+    #[test]
+    fn slugify_mixed_case_and_symbols() {
+        assert_eq!(slugify("Night Light / Toggle"), "night_light___toggle");
+    }
+
+    #[test]
+    fn slugify_disk_usage_mount_point() {
+        // Real usage from DiskUsageSensor
+        // Trailing / becomes _ which is then trimmed by trim_matches('_')
+        assert_eq!(slugify("Disk Usage /"), "disk_usage");
+        assert_eq!(slugify("Disk Usage /home"), "disk_usage__home");
+    }
+}

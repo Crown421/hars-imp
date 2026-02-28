@@ -91,3 +91,167 @@ impl ComponentRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mqtt::discovery::{ComponentType, HomeAssistantComponent};
+
+    /// A minimal mock component for registry tests.
+    struct MockComponent {
+        name: String,
+        topics: Vec<String>,
+    }
+
+    impl MockComponent {
+        fn new(name: &str, topics: Vec<&str>) -> Self {
+            Self {
+                name: name.to_string(),
+                topics: topics.into_iter().map(String::from).collect(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Component for MockComponent {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn discovery_component(&self) -> HomeAssistantComponent {
+            HomeAssistantComponent {
+                name: self.name.clone(),
+                unique_id: format!("mock_{}", self.name),
+                component_type: ComponentType::Button {
+                    command_topic: "unused".to_string(),
+                },
+            }
+        }
+
+        fn subscriptions(&self) -> Vec<String> {
+            self.topics.clone()
+        }
+
+        async fn handle_message(
+            &self,
+            _topic: &str,
+            _payload: &str,
+            _action_tx: &mpsc::Sender<ActionMessage>,
+        ) {
+        }
+
+        fn spawn_polling(
+            self: Arc<Self>,
+            _action_tx: mpsc::Sender<ActionMessage>,
+            _shutdown: CancellationToken,
+        ) -> Option<JoinHandle<()>> {
+            None
+        }
+
+        async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
+    }
+
+    #[test]
+    fn empty_registry() {
+        let registry = ComponentRegistry::new();
+        assert!(registry.components().is_empty());
+        assert!(registry.all_subscriptions().is_empty());
+        assert!(registry.components_for_topic("any/topic").is_empty());
+    }
+
+    #[test]
+    fn register_single_component() {
+        let mut registry = ComponentRegistry::new();
+        let c = Arc::new(MockComponent::new("btn", vec!["topic/a"]));
+        registry.register(c);
+
+        assert_eq!(registry.components().len(), 1);
+        assert_eq!(registry.components()[0].name(), "btn");
+    }
+
+    #[test]
+    fn route_to_correct_component() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(Arc::new(MockComponent::new("btn1", vec!["topic/a"])));
+        registry.register(Arc::new(MockComponent::new("btn2", vec!["topic/b"])));
+
+        let matches_a = registry.components_for_topic("topic/a");
+        assert_eq!(matches_a.len(), 1);
+        assert_eq!(matches_a[0].name(), "btn1");
+
+        let matches_b = registry.components_for_topic("topic/b");
+        assert_eq!(matches_b.len(), 1);
+        assert_eq!(matches_b[0].name(), "btn2");
+    }
+
+    #[test]
+    fn no_match_returns_empty() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(Arc::new(MockComponent::new("btn", vec!["topic/a"])));
+        assert!(registry
+            .components_for_topic("topic/nonexistent")
+            .is_empty());
+    }
+
+    #[test]
+    fn multiple_components_same_topic() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(Arc::new(MockComponent::new("c1", vec!["shared/topic"])));
+        registry.register(Arc::new(MockComponent::new("c2", vec!["shared/topic"])));
+
+        let matches = registry.components_for_topic("shared/topic");
+        assert_eq!(matches.len(), 2);
+        let names: Vec<&str> = matches.iter().map(|c| c.name()).collect();
+        assert!(names.contains(&"c1"));
+        assert!(names.contains(&"c2"));
+    }
+
+    #[test]
+    fn component_with_multiple_subscriptions() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(Arc::new(MockComponent::new(
+            "multi",
+            vec!["t/1", "t/2", "t/3"],
+        )));
+
+        assert_eq!(registry.components_for_topic("t/1").len(), 1);
+        assert_eq!(registry.components_for_topic("t/2").len(), 1);
+        assert_eq!(registry.components_for_topic("t/3").len(), 1);
+    }
+
+    #[test]
+    fn all_subscriptions_collects_unique_topics() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(Arc::new(MockComponent::new(
+            "c1",
+            vec!["topic/a", "topic/b"],
+        )));
+        registry.register(Arc::new(MockComponent::new(
+            "c2",
+            vec!["topic/b", "topic/c"],
+        )));
+
+        let mut subs = registry.all_subscriptions();
+        subs.sort();
+        assert_eq!(subs, vec!["topic/a", "topic/b", "topic/c"]);
+    }
+
+    #[test]
+    fn sensor_no_subscriptions() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(Arc::new(MockComponent::new("sensor", vec![])));
+
+        assert_eq!(registry.components().len(), 1);
+        assert!(registry.all_subscriptions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn route_message_dispatches() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(Arc::new(MockComponent::new("btn", vec!["topic/a"])));
+
+        let (tx, _rx) = mpsc::channel(16);
+        // Should not panic — dispatches to the mock component
+        registry.route_message("topic/a", "PRESS", &tx).await;
+    }
+}

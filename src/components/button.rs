@@ -86,3 +86,88 @@ impl Component for ButtonComponent {
         // Buttons have no state to re-publish.
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ButtonConfig;
+    use crate::mqtt::discovery::ComponentType;
+
+    fn test_button() -> ButtonComponent {
+        let config = ButtonConfig {
+            name: "Lock Screen".to_string(),
+            exec: "echo locked".to_string(),
+        };
+        ButtonComponent::new(&config, "myhost")
+    }
+
+    #[test]
+    fn button_name_and_ids() {
+        let btn = test_button();
+        assert_eq!(btn.name(), "Lock Screen");
+        assert_eq!(btn.unique_id, "myhost_lock_screen_button");
+    }
+
+    #[test]
+    fn button_command_topic() {
+        let btn = test_button();
+        assert_eq!(btn.command_topic, "homeassistant/button/myhost/lock_screen/set");
+    }
+
+    #[test]
+    fn button_subscriptions() {
+        let btn = test_button();
+        let subs = btn.subscriptions();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0], "homeassistant/button/myhost/lock_screen/set");
+    }
+
+    #[test]
+    fn button_discovery_component() {
+        let btn = test_button();
+        let disc = btn.discovery_component();
+        assert_eq!(disc.name, "Lock Screen");
+        assert_eq!(disc.unique_id, "myhost_lock_screen_button");
+        match disc.component_type {
+            ComponentType::Button { command_topic } => {
+                assert_eq!(command_topic, "homeassistant/button/myhost/lock_screen/set");
+            }
+            _ => panic!("Expected Button component type"),
+        }
+    }
+
+    #[test]
+    fn button_no_polling() {
+        let btn = Arc::new(test_button());
+        let (tx, _rx) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+        assert!(btn.spawn_polling(tx, shutdown).is_none());
+    }
+
+    #[tokio::test]
+    async fn button_handle_press_executes_command() {
+        let config = ButtonConfig {
+            name: "Echo Test".to_string(),
+            exec: "echo hello".to_string(),
+        };
+        let btn = ButtonComponent::new(&config, "myhost");
+        let (tx, _rx) = mpsc::channel(16);
+
+        // Should not panic — executes `echo hello`
+        btn.handle_message("topic", "PRESS", &tx).await;
+    }
+
+    #[tokio::test]
+    async fn button_ignores_non_press_payload() {
+        let btn = test_button();
+        let (tx, mut rx) = mpsc::channel(16);
+
+        // Non-PRESS payloads should be silently ignored
+        btn.handle_message("topic", "ON", &tx).await;
+        btn.handle_message("topic", "", &tx).await;
+        btn.handle_message("topic", "press", &tx).await; // case-sensitive
+
+        // No action messages should have been sent
+        assert!(rx.try_recv().is_err());
+    }
+}

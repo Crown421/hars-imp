@@ -164,3 +164,161 @@ async fn execute_dbus_switch(
     info!("D-Bus switch call: {}({state})", config.method);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SwitchConfig;
+    use crate::mqtt::discovery::ComponentType;
+
+    fn test_switch() -> SwitchComponent {
+        let config = SwitchConfig {
+            name: "Night Light".to_string(),
+            exec: Some("echo toggle".to_string()),
+            dbus: None,
+        };
+        SwitchComponent::new(&config, "myhost")
+    }
+
+    #[test]
+    fn switch_name_and_ids() {
+        let sw = test_switch();
+        assert_eq!(sw.name(), "Night Light");
+        assert_eq!(sw.unique_id, "myhost_night_light_switch");
+    }
+
+    #[test]
+    fn switch_topics() {
+        let sw = test_switch();
+        assert_eq!(sw.command_topic, "homeassistant/switch/myhost/night_light/set");
+        assert_eq!(sw.state_topic, "homeassistant/switch/myhost/night_light/state");
+    }
+
+    #[test]
+    fn switch_subscriptions() {
+        let sw = test_switch();
+        let subs = sw.subscriptions();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0], "homeassistant/switch/myhost/night_light/set");
+    }
+
+    #[test]
+    fn switch_discovery_component() {
+        let sw = test_switch();
+        let disc = sw.discovery_component();
+        assert_eq!(disc.name, "Night Light");
+        match disc.component_type {
+            ComponentType::Switch {
+                command_topic,
+                state_topic,
+            } => {
+                assert_eq!(command_topic, "homeassistant/switch/myhost/night_light/set");
+                assert_eq!(state_topic, "homeassistant/switch/myhost/night_light/state");
+            }
+            _ => panic!("Expected Switch component type"),
+        }
+    }
+
+    #[test]
+    fn switch_no_polling() {
+        let sw = Arc::new(test_switch());
+        let (tx, _rx) = mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+        assert!(sw.spawn_polling(tx, shutdown).is_none());
+    }
+
+    #[tokio::test]
+    async fn switch_initial_state_is_off() {
+        let sw = test_switch();
+        let state = *sw.state.lock().await;
+        assert!(!state, "Switch should start in OFF state");
+    }
+
+    #[tokio::test]
+    async fn switch_handle_on_updates_state() {
+        let config = SwitchConfig {
+            name: "Test".to_string(),
+            exec: Some("true".to_string()), // always succeeds
+            dbus: None,
+        };
+        let sw = SwitchComponent::new(&config, "myhost");
+        let (tx, mut rx) = mpsc::channel(16);
+
+        sw.handle_message("topic", "ON", &tx).await;
+
+        // State should now be ON
+        assert!(*sw.state.lock().await);
+
+        // Should have published state
+        let (topic, payload) = rx.try_recv().expect("should have published state");
+        assert!(topic.contains("state"));
+        assert_eq!(payload, "ON");
+    }
+
+    #[tokio::test]
+    async fn switch_handle_off_updates_state() {
+        let config = SwitchConfig {
+            name: "Test".to_string(),
+            exec: Some("true".to_string()),
+            dbus: None,
+        };
+        let sw = SwitchComponent::new(&config, "myhost");
+        let (tx, mut rx) = mpsc::channel(16);
+
+        // First turn ON
+        sw.handle_message("topic", "ON", &tx).await;
+        let _ = rx.try_recv(); // consume ON state publish
+
+        // Then turn OFF
+        sw.handle_message("topic", "OFF", &tx).await;
+        assert!(!*sw.state.lock().await);
+
+        let (_topic, payload) = rx.try_recv().expect("should have published state");
+        assert_eq!(payload, "OFF");
+    }
+
+    #[tokio::test]
+    async fn switch_unknown_payload_ignored() {
+        let sw = test_switch();
+        let (tx, mut rx) = mpsc::channel(16);
+
+        sw.handle_message("topic", "TOGGLE", &tx).await;
+
+        // State should remain OFF, no message published
+        assert!(!*sw.state.lock().await);
+        assert!(rx.try_recv().is_err(), "No state should be published for unknown payload");
+    }
+
+    #[tokio::test]
+    async fn switch_on_resume_publishes_current_state() {
+        let sw = test_switch();
+        let (tx, mut rx) = mpsc::channel(16);
+
+        // Default state is OFF
+        sw.on_resume(&tx).await;
+
+        let (topic, payload) = rx.try_recv().expect("should have published on resume");
+        assert!(topic.contains("state"));
+        assert_eq!(payload, "OFF");
+    }
+
+    #[tokio::test]
+    async fn switch_failed_command_does_not_update_state() {
+        let config = SwitchConfig {
+            name: "Fail".to_string(),
+            exec: Some("false".to_string()), // always fails (exit code 1)
+            dbus: None,
+        };
+        let sw = SwitchComponent::new(&config, "myhost");
+        let (tx, mut rx) = mpsc::channel(16);
+
+        sw.handle_message("topic", "ON", &tx).await;
+
+        // State should remain OFF because command failed
+        assert!(!*sw.state.lock().await);
+
+        // But state should still be published (showing OFF)
+        let (_topic, payload) = rx.try_recv().expect("should still publish state");
+        assert_eq!(payload, "OFF");
+    }
+}

@@ -35,3 +35,6 @@ thiserror = "2"
 
 # Async trait support
 async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -213,3 +213,276 @@ impl Config {
         format!("{}/status", self.device_base_topic())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Helper: write TOML to a temp file and load it.
+    fn load_toml(toml_content: &str) -> Result<Config, crate::error::ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(toml_content.as_bytes()).unwrap();
+        Config::load_from(&path)
+    }
+
+    const MINIMAL_CONFIG: &str = r#"
+hostname = "testhost"
+mqtt_url = "mqtt.example.com"
+username = "user"
+password = "pass"
+"#;
+
+    #[test]
+    fn parse_minimal_config() {
+        let config = load_toml(MINIMAL_CONFIG).expect("should parse");
+        assert_eq!(config.hostname, "testhost");
+        assert_eq!(config.mqtt_url, "mqtt.example.com");
+        assert_eq!(config.username, "user");
+        assert_eq!(config.password, "pass");
+    }
+
+    #[test]
+    fn defaults_applied() {
+        let config = load_toml(MINIMAL_CONFIG).unwrap();
+        assert_eq!(config.mqtt_port, 1883);
+        assert_eq!(config.log_level, "info");
+        assert_eq!(config.update_interval_secs, 60);
+        assert!(config.button.is_empty());
+        assert!(config.switch.is_empty());
+        assert!(config.tls.is_none());
+    }
+
+    #[test]
+    fn override_defaults() {
+        let toml = r#"
+hostname = "mypc"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+mqtt_port = 9999
+log_level = "debug"
+update_interval_secs = 10
+"#;
+        let config = load_toml(toml).unwrap();
+        assert_eq!(config.mqtt_port, 9999);
+        assert_eq!(config.log_level, "debug");
+        assert_eq!(config.update_interval_secs, 10);
+    }
+
+    #[test]
+    fn validation_empty_hostname() {
+        let toml = r#"
+hostname = ""
+mqtt_url = "broker"
+username = "u"
+password = "p"
+"#;
+        let err = load_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hostname"),
+            "Error should mention hostname: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_empty_mqtt_url() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = ""
+username = "u"
+password = "p"
+"#;
+        let err = load_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mqtt_url"),
+            "Error should mention mqtt_url: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_switch_needs_action() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[[switch]]
+name = "Bad Switch"
+"#;
+        let err = load_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exec") || msg.contains("dbus"),
+            "Error should mention missing action: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_switch_both_actions_rejected() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[[switch]]
+name = "Bad Switch"
+exec = "echo hi"
+[switch.dbus]
+service = "org.test"
+path = "/test"
+interface = "org.test.iface"
+method = "Toggle"
+"#;
+        let err = load_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("both"), "Error should mention both: {msg}");
+    }
+
+    #[test]
+    fn parse_buttons_and_switches() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[[button]]
+name = "Lock"
+exec = "loginctl lock-session"
+
+[[button]]
+name = "Reboot"
+exec = "systemctl reboot"
+
+[[switch]]
+name = "Night Light"
+exec = "toggle-nightlight"
+"#;
+        let config = load_toml(toml).unwrap();
+        assert_eq!(config.button.len(), 2);
+        assert_eq!(config.button[0].name, "Lock");
+        assert_eq!(config.button[1].exec, "systemctl reboot");
+        assert_eq!(config.switch.len(), 1);
+        assert_eq!(config.switch[0].name, "Night Light");
+    }
+
+    #[test]
+    fn tls_config_parsing() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[tls]
+ca_file = "/etc/ssl/ca.pem"
+client_cert = "/etc/ssl/client.pem"
+client_key = "/etc/ssl/client.key"
+"#;
+        let config = load_toml(toml).unwrap();
+        let tls = config.tls.as_ref().unwrap();
+        assert_eq!(tls.ca_file.as_deref(), Some("/etc/ssl/ca.pem"));
+        assert_eq!(tls.client_cert.as_deref(), Some("/etc/ssl/client.pem"));
+        assert_eq!(tls.client_key.as_deref(), Some("/etc/ssl/client.key"));
+    }
+
+    #[test]
+    fn tls_mtls_requires_both_cert_and_key() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[tls]
+client_cert = "/etc/ssl/client.pem"
+"#;
+        let err = load_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("client_cert") || msg.contains("client_key"),
+            "Error should mention mTLS: {msg}"
+        );
+    }
+
+    #[test]
+    fn effective_mqtt_port_default_no_tls() {
+        let config = load_toml(MINIMAL_CONFIG).unwrap();
+        assert_eq!(config.effective_mqtt_port(), 1883);
+    }
+
+    #[test]
+    fn effective_mqtt_port_auto_tls() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[tls]
+"#;
+        let config = load_toml(toml).unwrap();
+        // TLS enabled, port at default → should auto-select 8883
+        assert_eq!(config.effective_mqtt_port(), 8883);
+    }
+
+    #[test]
+    fn effective_mqtt_port_explicit_with_tls() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+mqtt_port = 9999
+
+[tls]
+"#;
+        let config = load_toml(toml).unwrap();
+        // Explicitly set port overrides auto-detection
+        assert_eq!(config.effective_mqtt_port(), 9999);
+    }
+
+    #[test]
+    fn derived_topic_helpers() {
+        let config = load_toml(MINIMAL_CONFIG).unwrap();
+        assert_eq!(config.device_base_topic(), "homeassistant/device/testhost");
+        assert_eq!(
+            config.discovery_topic(),
+            "homeassistant/device/testhost/config"
+        );
+        assert_eq!(
+            config.status_topic(),
+            "homeassistant/device/testhost/status"
+        );
+    }
+
+    #[test]
+    fn missing_required_field_is_parse_error() {
+        let toml = r#"
+hostname = "host"
+"#;
+        let err = load_toml(toml).unwrap_err();
+        // Should be a Parse error, not a Validation error
+        assert!(
+            matches!(err, crate::error::ConfigError::Parse(_)),
+            "Expected Parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_toml_syntax() {
+        let toml = "this is not valid toml [[[";
+        let err = load_toml(toml).unwrap_err();
+        assert!(
+            matches!(err, crate::error::ConfigError::Parse(_)),
+            "Expected Parse error, got: {err}"
+        );
+    }
+}
