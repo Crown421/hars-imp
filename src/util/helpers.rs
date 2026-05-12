@@ -6,7 +6,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-use crate::components::trait_def::ActionMessage;
+use crate::components::trait_def::{ActionMessage, OutboundMessage};
 
 /// Convert a name to a URL/topic-safe slug.
 pub fn slugify(name: &str) -> String {
@@ -165,7 +165,7 @@ where
                     debug!("{name}: {payload}");
 
                     if let Err(e) = action_tx
-                        .send((state_topic.clone(), payload))
+                        .send(OutboundMessage::state(state_topic.clone(), payload))
                         .await
                     {
                         error!("Failed to send {name} update: {e}");

@@ -7,8 +7,75 @@ use tokio_util::sync::CancellationToken;
 
 use crate::mqtt::discovery::HomeAssistantComponent;
 
-/// An outbound MQTT message: (topic, payload).
-pub type ActionMessage = (String, String);
+/// An outbound MQTT publish request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundMessage {
+    /// Replaceable entity state. Multiple pending messages for the same topic may be coalesced.
+    State { topic: String, payload: String },
+
+    /// Availability/status should be retained and should not be coalesced with state updates.
+    Availability { topic: String, payload: String },
+
+    /// Discovery payloads should be retained and preserved.
+    Discovery { topic: String, payload: String },
+
+    /// Non-state command response or ad hoc publish.
+    CommandResult { topic: String, payload: String },
+}
+
+impl OutboundMessage {
+    pub fn state(topic: impl Into<String>, payload: impl Into<String>) -> Self {
+        Self::State {
+            topic: topic.into(),
+            payload: payload.into(),
+        }
+    }
+
+    pub fn availability(topic: impl Into<String>, payload: impl Into<String>) -> Self {
+        Self::Availability {
+            topic: topic.into(),
+            payload: payload.into(),
+        }
+    }
+
+    pub fn discovery(topic: impl Into<String>, payload: impl Into<String>) -> Self {
+        Self::Discovery {
+            topic: topic.into(),
+            payload: payload.into(),
+        }
+    }
+
+    pub fn command_result(topic: impl Into<String>, payload: impl Into<String>) -> Self {
+        Self::CommandResult {
+            topic: topic.into(),
+            payload: payload.into(),
+        }
+    }
+
+    pub fn topic(&self) -> &str {
+        match self {
+            Self::State { topic, .. }
+            | Self::Availability { topic, .. }
+            | Self::Discovery { topic, .. }
+            | Self::CommandResult { topic, .. } => topic,
+        }
+    }
+
+    pub fn payload(&self) -> &str {
+        match self {
+            Self::State { payload, .. }
+            | Self::Availability { payload, .. }
+            | Self::Discovery { payload, .. }
+            | Self::CommandResult { payload, .. } => payload,
+        }
+    }
+
+    pub fn retain(&self) -> bool {
+        matches!(self, Self::Availability { .. } | Self::Discovery { .. })
+    }
+}
+
+pub type ActionMessage = OutboundMessage;
 
 /// The core abstraction for every Home Assistant entity.
 ///

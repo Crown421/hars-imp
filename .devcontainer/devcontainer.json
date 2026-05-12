@@ -10,21 +10,14 @@
 			"upgradePackages": "true",
 			"nonFreePackages": "true"
 		},
-		"ghcr.io/devcontainers/features/rust:1": {},
-		"ghcr.io/rio/features/chezmoi:1": {}
+		"ghcr.io/devcontainers-extra/features/mise:1": {},
+		"ghcr.io/devcontainers-extra/features/pre-commit:2": {},
+		"ghcr.io/rio/features/chezmoi:1": {},
+		"ghcr.io/devcontainers/features/rust:1": {}
 	},
 	"customizations": {
 		"vscode": {
 			"extensions": []
 		}
-	},
-	"runArgs": [
-		"--userns=keep-id",
-		"--security-opt=label=disable"
-	],
-	"containerEnv": {
-		"HOME": "/home/vscode"
-	},
-	"remoteUser": "vscode",
-	"containerUser": "vscode"
+	}
 }

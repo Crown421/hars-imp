@@ -6,7 +6,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::components::trait_def::{ActionMessage, Component};
+use crate::components::trait_def::{ActionMessage, Component, OutboundMessage};
 use crate::config::{DbusActionConfig, SwitchConfig};
 use crate::mqtt::discovery::{ComponentType, HomeAssistantComponent};
 use crate::util::helpers::{execute_command, slugify};
@@ -62,7 +62,7 @@ impl SwitchComponent {
         let state = *self.state.lock().await;
         let payload = if state { "ON" } else { "OFF" };
         let _ = action_tx
-            .send((self.state_topic.clone(), payload.to_string()))
+            .send(OutboundMessage::state(self.state_topic.clone(), payload))
             .await;
     }
 }
@@ -261,9 +261,9 @@ mod tests {
         assert!(*sw.state.lock().await);
 
         // Should have published state
-        let (topic, payload) = rx.try_recv().expect("should have published state");
-        assert!(topic.contains("state"));
-        assert_eq!(payload, "ON");
+        let message = rx.try_recv().expect("should have published state");
+        assert!(message.topic().contains("state"));
+        assert_eq!(message.payload(), "ON");
     }
 
     #[tokio::test]
@@ -284,8 +284,8 @@ mod tests {
         sw.handle_message("topic", "OFF", &tx).await;
         assert!(!*sw.state.lock().await);
 
-        let (_topic, payload) = rx.try_recv().expect("should have published state");
-        assert_eq!(payload, "OFF");
+        let message = rx.try_recv().expect("should have published state");
+        assert_eq!(message.payload(), "OFF");
     }
 
     #[tokio::test]
@@ -311,9 +311,9 @@ mod tests {
         // Default state is OFF
         sw.on_resume(&tx).await;
 
-        let (topic, payload) = rx.try_recv().expect("should have published on resume");
-        assert!(topic.contains("state"));
-        assert_eq!(payload, "OFF");
+        let message = rx.try_recv().expect("should have published on resume");
+        assert!(message.topic().contains("state"));
+        assert_eq!(message.payload(), "OFF");
     }
 
     #[tokio::test]
@@ -332,7 +332,7 @@ mod tests {
         assert!(!*sw.state.lock().await);
 
         // But state should still be published (showing OFF)
-        let (_topic, payload) = rx.try_recv().expect("should still publish state");
-        assert_eq!(payload, "OFF");
+        let message = rx.try_recv().expect("should still publish state");
+        assert_eq!(message.payload(), "OFF");
     }
 }

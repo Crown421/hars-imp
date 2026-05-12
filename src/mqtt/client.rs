@@ -1,4 +1,6 @@
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Cursor};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,11 +12,14 @@ use rumqttc::{
     AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, TlsConfiguration, Transport,
 };
 use tokio::sync::mpsc;
+use tokio::time::Sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::components::trait_def::ActionMessage;
+use crate::components::trait_def::{ActionMessage, OutboundMessage};
 use crate::config::Config;
 use crate::error::MqttError;
+
+const COMMAND_RESULT_BUFFER_CAP: usize = 256;
 
 /// Wraps the rumqttc async client with reconnection-aware logic.
 pub struct MqttClient {
@@ -83,43 +88,266 @@ impl MqttClient {
     ) {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(60);
+        let mut reconnect_delay: Option<Pin<Box<Sleep>>> = None;
+        let mut publish_buffer = PublishBuffer::new();
+        let mut connected = false;
+        let mut outbound_paused = false;
         let client = self.client.clone();
 
         loop {
             tokio::select! {
                 // Poll the MQTT event loop
-                poll_result = self.eventloop.poll() => {
+                poll_result = self.eventloop.poll(), if reconnect_delay.is_none() => {
+                    outbound_paused = false;
                     match poll_result {
                         Ok(event) => {
                             backoff = Duration::from_secs(1); // reset on success
+                            if is_connack(&event) {
+                                connected = true;
+                            }
                             handle_event(event, &event_tx).await;
                         }
                         Err(e) => {
+                            connected = false;
                             let msg = format!("{e}");
                             error!("MQTT poll error: {msg}");
                             let _ = event_tx.send(MqttEvent::Disconnected(msg)).await;
 
-                            tokio::time::sleep(backoff).await;
+                            reconnect_delay = Some(Box::pin(tokio::time::sleep(backoff)));
                             backoff = (backoff * 2).min(max_backoff);
                         }
                     }
                 }
 
+                _ = wait_for_reconnect_delay(&mut reconnect_delay), if reconnect_delay.is_some() => {
+                    reconnect_delay = None;
+                }
+
                 // Drain outbound action messages
-                Some((topic, payload)) = action_rx.recv() => {
-                    let payload_bytes: &[u8] = payload.as_bytes();
-                    if let Err(e) = client.publish(
-                        &topic,
-                        QoS::AtLeastOnce,
-                        false,
-                        payload_bytes,
-                    ).await {
-                        warn!("Failed to publish to {topic}: {e}");
+                Some(message) = action_rx.recv() => {
+                    publish_buffer.push(message);
+                    drain_available_actions(&mut action_rx, &mut publish_buffer);
+                }
+
+                _ = tokio::task::yield_now(), if connected && publish_buffer.has_pending() && !outbound_paused => {
+                    let message = publish_buffer
+                        .pop_next()
+                        .expect("buffer should contain a pending outbound message");
+                    if let Err(error) = try_publish_outbound(&client, message) {
+                        let (message, e) = *error;
+                        warn!("Failed to enqueue publish to {}: {e}", message.topic());
+                        publish_buffer.push_front(message);
+                        outbound_paused = true;
                     }
                 }
             }
         }
     }
+}
+
+struct PublishBuffer {
+    availability_order: VecDeque<String>,
+    availability: HashMap<String, String>,
+    discovery_order: VecDeque<String>,
+    discovery: HashMap<String, String>,
+    command_results: VecDeque<OutboundMessage>,
+    state_order: VecDeque<String>,
+    states: HashMap<String, String>,
+    command_result_cap: usize,
+}
+
+impl PublishBuffer {
+    fn new() -> Self {
+        Self::with_command_result_cap(COMMAND_RESULT_BUFFER_CAP)
+    }
+
+    fn with_command_result_cap(command_result_cap: usize) -> Self {
+        Self {
+            availability_order: VecDeque::new(),
+            availability: HashMap::new(),
+            discovery_order: VecDeque::new(),
+            discovery: HashMap::new(),
+            command_results: VecDeque::new(),
+            state_order: VecDeque::new(),
+            states: HashMap::new(),
+            command_result_cap,
+        }
+    }
+
+    fn push(&mut self, message: OutboundMessage) {
+        match message {
+            OutboundMessage::State { topic, payload } => {
+                push_coalesced(&mut self.state_order, &mut self.states, topic, payload)
+            }
+            OutboundMessage::Availability { topic, payload } => {
+                push_coalesced(
+                    &mut self.availability_order,
+                    &mut self.availability,
+                    topic,
+                    payload,
+                );
+            }
+            OutboundMessage::Discovery { topic, payload } => {
+                push_coalesced(
+                    &mut self.discovery_order,
+                    &mut self.discovery,
+                    topic,
+                    payload,
+                );
+            }
+            message @ OutboundMessage::CommandResult { .. } => {
+                if self.command_results.len() == self.command_result_cap {
+                    if let Some(dropped) = self.command_results.pop_front() {
+                        warn!(
+                            "Dropping oldest buffered command result for '{}' because the outbound buffer is full",
+                            dropped.topic()
+                        );
+                    }
+                }
+                self.command_results.push_back(message);
+            }
+        }
+    }
+
+    fn push_front(&mut self, message: OutboundMessage) {
+        match message {
+            OutboundMessage::State { topic, payload } => {
+                push_coalesced_front(&mut self.state_order, &mut self.states, topic, payload);
+            }
+            OutboundMessage::Availability { topic, payload } => {
+                push_coalesced_front(
+                    &mut self.availability_order,
+                    &mut self.availability,
+                    topic,
+                    payload,
+                );
+            }
+            OutboundMessage::Discovery { topic, payload } => {
+                push_coalesced_front(
+                    &mut self.discovery_order,
+                    &mut self.discovery,
+                    topic,
+                    payload,
+                );
+            }
+            message @ OutboundMessage::CommandResult { .. } => {
+                if self.command_results.len() == self.command_result_cap {
+                    if let Some(dropped) = self.command_results.pop_back() {
+                        warn!(
+                            "Dropping newest buffered command result for '{}' to retry a failed publish",
+                            dropped.topic()
+                        );
+                    }
+                }
+                self.command_results.push_front(message);
+            }
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<OutboundMessage> {
+        if let Some(message) = pop_coalesced(
+            &mut self.availability_order,
+            &mut self.availability,
+            OutboundMessage::availability,
+        ) {
+            return Some(message);
+        }
+
+        if let Some(message) = pop_coalesced(
+            &mut self.discovery_order,
+            &mut self.discovery,
+            OutboundMessage::discovery,
+        ) {
+            return Some(message);
+        }
+
+        if let Some(message) = self.command_results.pop_front() {
+            return Some(message);
+        }
+
+        pop_coalesced(
+            &mut self.state_order,
+            &mut self.states,
+            OutboundMessage::state,
+        )
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.availability_order.is_empty()
+            || !self.discovery_order.is_empty()
+            || !self.command_results.is_empty()
+            || !self.state_order.is_empty()
+    }
+}
+
+fn push_coalesced(
+    order: &mut VecDeque<String>,
+    messages: &mut HashMap<String, String>,
+    topic: String,
+    payload: String,
+) {
+    if !messages.contains_key(&topic) {
+        order.push_back(topic.clone());
+    }
+    messages.insert(topic, payload);
+}
+
+fn push_coalesced_front(
+    order: &mut VecDeque<String>,
+    messages: &mut HashMap<String, String>,
+    topic: String,
+    payload: String,
+) {
+    if !messages.contains_key(&topic) {
+        order.push_front(topic.clone());
+    }
+    messages.insert(topic, payload);
+}
+
+fn pop_coalesced(
+    order: &mut VecDeque<String>,
+    messages: &mut HashMap<String, String>,
+    build: impl Fn(String, String) -> OutboundMessage,
+) -> Option<OutboundMessage> {
+    while let Some(topic) = order.pop_front() {
+        if let Some(payload) = messages.remove(&topic) {
+            return Some(build(topic, payload));
+        }
+    }
+
+    None
+}
+
+fn drain_available_actions(
+    action_rx: &mut mpsc::Receiver<ActionMessage>,
+    publish_buffer: &mut PublishBuffer,
+) {
+    while let Ok(message) = action_rx.try_recv() {
+        publish_buffer.push(message);
+    }
+}
+
+fn try_publish_outbound(
+    client: &AsyncClient,
+    message: OutboundMessage,
+) -> Result<(), Box<(OutboundMessage, rumqttc::ClientError)>> {
+    let topic = message.topic().to_string();
+    let retain = message.retain();
+    let payload = message.payload().as_bytes().to_vec();
+
+    client
+        .try_publish(&topic, QoS::AtLeastOnce, retain, payload)
+        .map_err(|e| Box::new((message, e)))
+}
+
+async fn wait_for_reconnect_delay(delay: &mut Option<Pin<Box<Sleep>>>) {
+    if let Some(delay) = delay {
+        delay.as_mut().await;
+    }
+}
+
+fn is_connack(event: &Event) -> bool {
+    matches!(event, Event::Incoming(Packet::ConnAck(_)))
 }
 
 async fn handle_event(event: Event, event_tx: &mpsc::Sender<MqttEvent>) {
@@ -239,4 +467,88 @@ pub async fn subscribe_topics(client: &AsyncClient, topics: &[String]) -> Result
         client.subscribe(topic, QoS::AtLeastOnce).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publish_buffer_coalesces_state_by_topic() {
+        let mut buffer = PublishBuffer::new();
+        buffer.push(OutboundMessage::state("topic/a", "old"));
+        buffer.push(OutboundMessage::state("topic/a", "new"));
+
+        let message = buffer.pop_next().expect("state should remain pending");
+        assert_eq!(message.topic(), "topic/a");
+        assert_eq!(message.payload(), "new");
+        assert!(buffer.pop_next().is_none());
+    }
+
+    #[test]
+    fn publish_buffer_preserves_reliable_messages_before_state() {
+        let mut buffer = PublishBuffer::new();
+        buffer.push(OutboundMessage::state("state/topic", "ON"));
+        buffer.push(OutboundMessage::availability("status/topic", "online"));
+        buffer.push(OutboundMessage::discovery("discovery/topic", "{}"));
+
+        let first = buffer
+            .pop_next()
+            .expect("availability should publish first");
+        assert_eq!(first.topic(), "status/topic");
+        assert!(first.retain());
+
+        let second = buffer.pop_next().expect("discovery should publish second");
+        assert_eq!(second.topic(), "discovery/topic");
+        assert!(second.retain());
+
+        let third = buffer.pop_next().expect("state should publish last");
+        assert_eq!(third.topic(), "state/topic");
+        assert!(!third.retain());
+    }
+
+    #[test]
+    fn publish_buffer_coalesces_retained_messages_by_topic() {
+        let mut buffer = PublishBuffer::new();
+        buffer.push(OutboundMessage::availability("status/topic", "offline"));
+        buffer.push(OutboundMessage::availability("status/topic", "online"));
+        buffer.push(OutboundMessage::discovery("discovery/topic", "old"));
+        buffer.push(OutboundMessage::discovery("discovery/topic", "new"));
+
+        let first = buffer
+            .pop_next()
+            .expect("availability should remain pending");
+        assert_eq!(first.topic(), "status/topic");
+        assert_eq!(first.payload(), "online");
+        assert!(first.retain());
+
+        let second = buffer.pop_next().expect("discovery should remain pending");
+        assert_eq!(second.topic(), "discovery/topic");
+        assert_eq!(second.payload(), "new");
+        assert!(second.retain());
+
+        assert!(buffer.pop_next().is_none());
+    }
+
+    #[test]
+    fn publish_buffer_caps_command_results_and_drops_oldest() {
+        let mut buffer = PublishBuffer::with_command_result_cap(2);
+        buffer.push(OutboundMessage::command_result("command/1", "one"));
+        buffer.push(OutboundMessage::command_result("command/2", "two"));
+        buffer.push(OutboundMessage::command_result("command/3", "three"));
+
+        let first = buffer
+            .pop_next()
+            .expect("second command result should remain");
+        assert_eq!(first.topic(), "command/2");
+        assert_eq!(first.payload(), "two");
+
+        let second = buffer
+            .pop_next()
+            .expect("third command result should remain");
+        assert_eq!(second.topic(), "command/3");
+        assert_eq!(second.payload(), "three");
+
+        assert!(buffer.pop_next().is_none());
+    }
 }

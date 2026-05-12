@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 use zbus::zvariant::OwnedFd;
 use zbus::Connection;
 
@@ -37,14 +39,15 @@ impl PowerMonitor {
     ) -> Result<(Self, broadcast::Receiver<PowerEvent>), crate::error::DbusError> {
         let (power_tx, power_rx) = broadcast::channel(8);
 
-        Ok((
-            Self {
-                system_conn,
-                power_tx,
-                inhibitor_fd: Mutex::new(None),
-            },
-            power_rx,
-        ))
+        Ok((Self::with_sender(system_conn, power_tx), power_rx))
+    }
+
+    fn with_sender(system_conn: Connection, power_tx: broadcast::Sender<PowerEvent>) -> Self {
+        Self {
+            system_conn,
+            power_tx,
+            inhibitor_fd: Mutex::new(None),
+        }
     }
 
     /// Get an additional receiver for power events.
@@ -102,7 +105,7 @@ impl PowerMonitor {
             }
         }
 
-        debug!("Power monitor signal stream ended");
+        warn!("Power monitor signal stream ended");
         Ok(())
     }
 
@@ -144,28 +147,170 @@ impl PowerMonitor {
     }
 }
 
-/// Attempt to reconnect to the system D-Bus with retries.
-#[allow(dead_code)]
-pub async fn reconnect_system_dbus(
-    max_retries: u32,
-) -> Result<Connection, crate::error::DbusError> {
-    let mut attempt = 0;
+/// Handle for the supervised power monitor task.
+pub struct PowerMonitorSupervisor {
+    pub receiver: broadcast::Receiver<PowerEvent>,
+    shutdown: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+impl PowerMonitorSupervisor {
+    /// Spawn a supervised power monitor loop.
+    pub fn spawn() -> Self {
+        let (power_tx, receiver) = broadcast::channel(8);
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(supervise_power_monitor(
+            power_tx,
+            shutdown.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            run_power_monitor_once,
+        ));
+
+        Self {
+            receiver,
+            shutdown,
+            handle,
+        }
+    }
+
+    /// Cancel the supervisor and wait briefly for it to exit.
+    pub async fn shutdown(self) {
+        self.shutdown.cancel();
+        match tokio::time::timeout(Duration::from_secs(2), self.handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Power monitor supervisor task failed during shutdown: {e}"),
+            Err(_) => warn!("Timed out waiting for power monitor supervisor shutdown"),
+        }
+    }
+}
+
+async fn run_power_monitor_once(
+    power_tx: broadcast::Sender<PowerEvent>,
+) -> Result<(), crate::error::DbusError> {
+    let conn = crate::dbus::client::system_connection().await?;
+    info!("D-Bus system connection established for power monitoring");
+    let monitor = PowerMonitor::with_sender(conn, power_tx);
+    monitor.run().await
+}
+
+async fn supervise_power_monitor<F, Fut>(
+    power_tx: broadcast::Sender<PowerEvent>,
+    shutdown: CancellationToken,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    mut run_once: F,
+) where
+    F: FnMut(broadcast::Sender<PowerEvent>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), crate::error::DbusError>>,
+{
+    let mut attempt: u64 = 1;
+    let mut backoff = initial_backoff;
+
     loop {
-        attempt += 1;
-        match Connection::system().await {
-            Ok(conn) => {
-                info!("D-Bus system connection established (attempt {attempt})");
-                return Ok(conn);
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("Power monitor supervisor shutting down");
+                return;
             }
+            result = run_once(power_tx.clone()) => result,
+        };
+
+        match result {
+            Ok(()) => warn!(
+                "Power monitor exited unexpectedly; restarting attempt {attempt} in {backoff:?}"
+            ),
             Err(e) => {
-                if attempt >= max_retries {
-                    error!("Failed to connect to D-Bus after {max_retries} attempts");
-                    return Err(crate::error::DbusError::ConnectionFailed);
-                }
-                warn!("D-Bus connection attempt {attempt} failed: {e}");
-                let delay = Duration::from_secs(1 << attempt.min(5));
-                tokio::time::sleep(delay).await;
+                warn!("Power monitor failed: {e}; restarting attempt {attempt} in {backoff:?}")
             }
         }
+
+        let delay = backoff;
+        attempt += 1;
+        backoff = (backoff * 2).min(max_backoff);
+
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("Power monitor supervisor shutting down");
+                return;
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn supervisor_restarts_after_monitor_exit() {
+        let (tx, _rx) = broadcast::channel(8);
+        let shutdown = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_task = Arc::clone(&attempts);
+
+        let handle = tokio::spawn(supervise_power_monitor(
+            tx,
+            shutdown.clone(),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            move |_| {
+                let attempts = Arc::clone(&attempts_for_task);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("supervisor should restart after an unexpected exit");
+
+        shutdown.cancel();
+        handle.await.expect("supervisor task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn supervisor_stops_without_restart_after_shutdown() {
+        let (tx, _rx) = broadcast::channel(8);
+        let shutdown = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_task = Arc::clone(&attempts);
+
+        let handle = tokio::spawn(supervise_power_monitor(
+            tx,
+            shutdown.clone(),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            move |_| {
+                let attempts = Arc::clone(&attempts_for_task);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first monitor attempt should run");
+
+        shutdown.cancel();
+        handle.await.expect("supervisor task should exit cleanly");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

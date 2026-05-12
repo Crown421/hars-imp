@@ -60,7 +60,8 @@ This document tracks implementation status for the `take-2` rewrite. Each sectio
 | `cargo check` passes | ✅ | Zero warnings, all modules compile |
 | `cargo build` passes | ✅ | Full debug build succeeds |
 | Manual testing | ⬜ | Requires MQTT broker + HA instance |
-| Unit tests | ⬜ | Future work |
+| Unit tests | ✅ | 63 tests across 6 modules (config, registry, button, switch, helpers, discovery) |
+| Integration tests | ✅ | 8 tests with ephemeral mosquitto broker (`tests/mqtt_integration.rs`) |
 
 ---
 
@@ -106,5 +107,5 @@ This document tracks implementation status for the `take-2` rewrite. Each sectio
 
 ### P4 — Testing
 - [x] Unit tests — config parsing/validation, `ComponentRegistry` routing, `handle_message` with known payloads, `slugify` edge cases, discovery JSON serialization round-trip (63 tests across 6 modules)
-- [ ] Integration tests with mock MQTT broker (e.g. `mosquitto` in Docker)
+- [x] Integration tests with mosquitto broker — MQTT connect/pub/sub round-trip, discovery publishing, component lifecycle, switch state round-trip, resume state, retained messages, registry routing end-to-end (8 tests in `tests/mqtt_integration.rs`)
 - [ ] Manual testing — requires MQTT broker + HA instance

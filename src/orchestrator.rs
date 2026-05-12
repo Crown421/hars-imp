@@ -1,19 +1,20 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::components::notification::NotificationComponent;
 use crate::components::registry::ComponentRegistry;
 use crate::components::system_monitor::{CpuSensor, DiskUsageSensor, MemorySensor};
-use crate::components::trait_def::{ActionMessage, Component};
+use crate::components::trait_def::{ActionMessage, Component, OutboundMessage};
 use crate::components::{button::ButtonComponent, switch::SwitchComponent};
 use crate::config::Config;
-use crate::dbus::power::{PowerEvent, PowerMonitor};
+use crate::dbus::power::{PowerEvent, PowerMonitorSupervisor};
 use crate::mqtt::client::{publish_retained, subscribe_topics, MqttClient, MqttEvent};
 use crate::mqtt::discovery::DeviceDiscoveryBuilder;
 use crate::util::helpers::slugify;
@@ -33,6 +34,7 @@ impl Orchestrator {
         // --- Build component registry ---
         let mut registry = ComponentRegistry::new();
         self.register_components(&mut registry);
+        let registry = Arc::new(registry);
 
         info!(
             "Registered {} components with {} subscriptions",
@@ -43,19 +45,33 @@ impl Orchestrator {
         // --- Set up channels ---
         let (action_tx, action_rx) = mpsc::channel::<ActionMessage>(100);
         let (event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(100);
+        let (sync_tx, sync_rx) = mpsc::channel::<()>(8);
 
         // --- Create MQTT client ---
         let mqtt_client = MqttClient::new(&self.config)?;
         let mqtt_async_client = mqtt_client.client();
 
-        // --- Set up D-Bus power monitoring ---
-        let power_rx = self.setup_power_monitor().await;
+        // --- Set up supervised D-Bus power monitoring ---
+        let power_supervisor = PowerMonitorSupervisor::spawn();
+        let power_rx = power_supervisor.receiver.resubscribe();
 
         // --- Prepare discovery payload ---
         let discovery_json = self.build_discovery_json(&registry)?;
 
         // --- Spawn MQTT event loop ---
         let _mqtt_handle = tokio::spawn(mqtt_client.run(event_tx, action_rx));
+
+        // --- Spawn reconnect synchronization worker ---
+        let sync_shutdown = CancellationToken::new();
+        let sync_handle = Self::spawn_reconnect_sync_worker(
+            self.config.clone(),
+            Arc::clone(&registry),
+            mqtt_async_client.clone(),
+            discovery_json.clone(),
+            action_tx.clone(),
+            sync_rx,
+            sync_shutdown.clone(),
+        );
 
         // --- Cancellation token for polling tasks ---
         let mut polling_shutdown = CancellationToken::new();
@@ -70,8 +86,7 @@ impl Orchestrator {
                 power_rx,
                 &registry,
                 &action_tx,
-                &mqtt_async_client,
-                &discovery_json,
+                &sync_tx,
                 &mut polling_shutdown,
                 &mut polling_handles,
             )
@@ -80,6 +95,9 @@ impl Orchestrator {
         // --- Graceful shutdown ---
         info!("Shutting down...");
         polling_shutdown.cancel();
+        sync_shutdown.cancel();
+        await_task("reconnect sync worker", sync_handle).await;
+        power_supervisor.shutdown().await;
 
         // Publish offline status.
         if let Err(e) =
@@ -180,37 +198,6 @@ impl Orchestrator {
         Ok(json)
     }
 
-    /// Set up the D-Bus power monitor. Returns a broadcast receiver.
-    ///
-    /// If D-Bus is unavailable (e.g. in a container), logs a warning and
-    /// returns a receiver that will never produce events.
-    async fn setup_power_monitor(&self) -> tokio::sync::broadcast::Receiver<PowerEvent> {
-        match crate::dbus::client::system_connection().await {
-            Ok(conn) => match PowerMonitor::new(conn).await {
-                Ok((monitor, rx)) => {
-                    tokio::spawn(async move {
-                        if let Err(e) = monitor.run().await {
-                            error!("Power monitor error: {e}");
-                        }
-                    });
-                    rx
-                }
-                Err(e) => {
-                    warn!("Failed to create power monitor: {e}");
-                    let (tx, rx) = tokio::sync::broadcast::channel(1);
-                    std::mem::forget(tx); // keep alive
-                    rx
-                }
-            },
-            Err(e) => {
-                warn!("D-Bus system bus unavailable: {e}. Power monitoring disabled.");
-                let (tx, rx) = tokio::sync::broadcast::channel(1);
-                std::mem::forget(tx);
-                rx
-            }
-        }
-    }
-
     /// The main event loop: select! over MQTT events, power events, and shutdown signals.
     #[allow(clippy::too_many_arguments)]
     async fn main_loop(
@@ -219,8 +206,7 @@ impl Orchestrator {
         mut power_rx: tokio::sync::broadcast::Receiver<PowerEvent>,
         registry: &ComponentRegistry,
         action_tx: &mpsc::Sender<ActionMessage>,
-        mqtt_client: &rumqttc::AsyncClient,
-        discovery_json: &str,
+        sync_tx: &mpsc::Sender<()>,
         polling_shutdown: &mut CancellationToken,
         polling_handles: &mut Vec<JoinHandle<()>>,
     ) -> Result<(), crate::error::AppError> {
@@ -234,13 +220,8 @@ impl Orchestrator {
                 Some(event) = event_rx.recv() => {
                     match event {
                         MqttEvent::Connected => {
-                            info!("MQTT connected — publishing discovery and subscribing");
-                            self.on_mqtt_connected(
-                                mqtt_client,
-                                registry,
-                                discovery_json,
-                                action_tx,
-                            ).await;
+                            info!("MQTT connected — scheduling reconnect synchronization");
+                            request_reconnect_sync(sync_tx);
                         }
                         MqttEvent::Message(topic, payload) => {
                             registry.route_message(&topic, &payload, action_tx).await;
@@ -261,7 +242,10 @@ impl Orchestrator {
 
                             // Publish suspended status.
                             let _ = action_tx
-                                .send((self.config.status_topic(), "offline".to_string()))
+                                .send(OutboundMessage::availability(
+                                    self.config.status_topic(),
+                                    "offline",
+                                ))
                                 .await;
 
                             // Give MQTT time to flush.
@@ -279,8 +263,9 @@ impl Orchestrator {
                                 polling_shutdown.clone(),
                             );
 
-                            // Notify all components to re-publish state.
-                            registry.notify_resume(action_tx).await;
+                            // Treat resume like a reconnect/state synchronization event
+                            // even if the MQTT connection does not emit a fresh ConnAck.
+                            request_reconnect_sync(sync_tx);
                         }
                     }
                 }
@@ -298,34 +283,157 @@ impl Orchestrator {
         }
     }
 
-    /// Called when MQTT connects/reconnects: publish discovery, subscribe, publish online,
-    /// and publish current component states.
-    async fn on_mqtt_connected(
-        &self,
-        client: &rumqttc::AsyncClient,
-        registry: &ComponentRegistry,
-        discovery_json: &str,
-        action_tx: &mpsc::Sender<ActionMessage>,
-    ) {
-        // Publish discovery (retained).
-        if let Err(e) =
-            publish_retained(client, &self.config.discovery_topic(), discovery_json).await
-        {
-            error!("Failed to publish discovery: {e}");
+    fn spawn_reconnect_sync_worker(
+        config: Config,
+        registry: Arc<ComponentRegistry>,
+        client: rumqttc::AsyncClient,
+        discovery_json: String,
+        action_tx: mpsc::Sender<ActionMessage>,
+        mut sync_rx: mpsc::Receiver<()>,
+        shutdown: CancellationToken,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        info!("Reconnect sync worker shutting down");
+                        return;
+                    }
+                    Some(()) = sync_rx.recv() => {
+                        drain_reconnect_sync_requests(&mut sync_rx);
+                        retry_reconnect_sync(&shutdown, Duration::from_secs(1), Duration::from_secs(30), || {
+                            reconnect_sync_once(
+                                &config,
+                                registry.as_ref(),
+                                &client,
+                                &discovery_json,
+                                &action_tx,
+                            )
+                        }).await;
+                    }
+                    else => return,
+                }
+            }
+        })
+    }
+}
+
+async fn reconnect_sync_once(
+    config: &Config,
+    registry: &ComponentRegistry,
+    client: &rumqttc::AsyncClient,
+    discovery_json: &str,
+    action_tx: &mpsc::Sender<ActionMessage>,
+) -> Result<(), crate::error::AppError> {
+    // Publish discovery (retained).
+    publish_retained(client, &config.discovery_topic(), discovery_json)
+        .await
+        .map_err(Box::new)?;
+
+    // Subscribe to all component topics.
+    let topics = registry.all_subscriptions();
+    subscribe_topics(client, &topics).await.map_err(Box::new)?;
+
+    // Publish online status (retained).
+    publish_retained(client, &config.status_topic(), "online")
+        .await
+        .map_err(Box::new)?;
+
+    // Publish current state for all stateful components (e.g. switches).
+    registry.notify_resume(action_tx).await;
+    Ok(())
+}
+
+async fn retry_reconnect_sync<F, Fut>(
+    shutdown: &CancellationToken,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    mut sync_once: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), crate::error::AppError>>,
+{
+    let mut attempt: u64 = 1;
+    let mut backoff = initial_backoff;
+
+    loop {
+        match sync_once().await {
+            Ok(()) => {
+                info!("Reconnect synchronization completed");
+                return;
+            }
+            Err(e) => {
+                warn!("Reconnect synchronization attempt {attempt} failed: {e}; retrying in {backoff:?}");
+            }
         }
 
-        // Subscribe to all component topics.
-        let topics = registry.all_subscriptions();
-        if let Err(e) = subscribe_topics(client, &topics).await {
-            error!("Failed to subscribe: {e}");
-        }
+        let delay = backoff;
+        attempt += 1;
+        backoff = (backoff * 2).min(max_backoff);
 
-        // Publish online status (retained).
-        if let Err(e) = publish_retained(client, &self.config.status_topic(), "online").await {
-            error!("Failed to publish online status: {e}");
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(delay) => {}
         }
+    }
+}
 
-        // Publish current state for all stateful components (e.g. switches).
-        registry.notify_resume(action_tx).await;
+fn request_reconnect_sync(sync_tx: &mpsc::Sender<()>) {
+    match sync_tx.try_send(()) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!("Reconnect synchronization already queued")
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!("Reconnect synchronization worker is not running")
+        }
+    }
+}
+
+fn drain_reconnect_sync_requests(sync_rx: &mut mpsc::Receiver<()>) {
+    while sync_rx.try_recv().is_ok() {}
+}
+
+async fn await_task(name: &str, handle: JoinHandle<()>) {
+    match tokio::time::timeout(Duration::from_secs(2), handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("{name} failed during shutdown: {e}"),
+        Err(_) => warn!("Timed out waiting for {name} shutdown"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn reconnect_sync_retries_until_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_sync = Arc::clone(&attempts);
+        let shutdown = CancellationToken::new();
+
+        retry_reconnect_sync(
+            &shutdown,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            move || {
+                let attempts = Arc::clone(&attempts_for_sync);
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Err(crate::error::ComponentError::InvalidPayload("fail once".into()).into())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }

@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use super::trait_def::{ActionMessage, Component};
 
 /// Manages a collection of components and provides O(1) topic-based routing.
 pub struct ComponentRegistry {
+    /// Maximum number of inbound component handlers that may run concurrently.
+    handler_permits: Arc<Semaphore>,
+
     /// All registered components.
     components: Vec<Arc<dyn Component>>,
 
@@ -19,7 +23,13 @@ pub struct ComponentRegistry {
 impl ComponentRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
+        Self::with_handler_limit(64)
+    }
+
+    /// Create a registry with a custom inbound handler concurrency limit.
+    pub fn with_handler_limit(handler_limit: usize) -> Self {
         Self {
+            handler_permits: Arc::new(Semaphore::new(handler_limit)),
             components: Vec::new(),
             topic_map: HashMap::new(),
         }
@@ -80,11 +90,22 @@ impl ComponentRegistry {
     ) {
         let targets = self.components_for_topic(topic);
         for component in targets {
+            let permit = match Arc::clone(&self.handler_permits).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    warn!(
+                        "Dropping inbound MQTT message for '{}' because handler concurrency limit is exhausted",
+                        component.name()
+                    );
+                    continue;
+                }
+            };
             let topic = topic.to_string();
             let payload = payload.to_string();
             let action_tx = action_tx.clone();
 
             tokio::spawn(async move {
+                let _permit = permit;
                 component.handle_message(&topic, &payload, &action_tx).await;
             });
         }
@@ -108,6 +129,7 @@ impl Default for ComponentRegistry {
 mod tests {
     use super::*;
     use crate::mqtt::discovery::{ComponentType, HomeAssistantComponent};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// A minimal mock component for registry tests.
@@ -192,6 +214,52 @@ mod tests {
             _payload: &str,
             _action_tx: &mpsc::Sender<ActionMessage>,
         ) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        fn spawn_polling(
+            self: Arc<Self>,
+            _action_tx: mpsc::Sender<ActionMessage>,
+            _shutdown: CancellationToken,
+        ) -> Option<JoinHandle<()>> {
+            None
+        }
+
+        async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
+    }
+
+    struct CountingSlowComponent {
+        name: &'static str,
+        started: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Component for CountingSlowComponent {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn discovery_component(&self) -> HomeAssistantComponent {
+            HomeAssistantComponent {
+                name: self.name.to_string(),
+                unique_id: self.name.to_string(),
+                component_type: ComponentType::Button {
+                    command_topic: "topic/a".to_string(),
+                },
+            }
+        }
+
+        fn subscriptions(&self) -> Vec<String> {
+            vec!["topic/a".to_string()]
+        }
+
+        async fn handle_message(
+            &self,
+            _topic: &str,
+            _payload: &str,
+            _action_tx: &mpsc::Sender<ActionMessage>,
+        ) {
+            self.started.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
@@ -326,5 +394,33 @@ mod tests {
             result.is_ok(),
             "routing should not wait for handler completion"
         );
+    }
+
+    #[tokio::test]
+    async fn route_message_drops_when_handler_limit_is_exhausted() {
+        let mut registry = ComponentRegistry::with_handler_limit(1);
+        let started = Arc::new(AtomicUsize::new(0));
+
+        registry.register(Arc::new(CountingSlowComponent {
+            name: "slow-a",
+            started: Arc::clone(&started),
+        }));
+        registry.register(Arc::new(CountingSlowComponent {
+            name: "slow-b",
+            started: Arc::clone(&started),
+        }));
+
+        let (tx, _rx) = mpsc::channel(16);
+        registry.route_message("topic/a", "PRESS", &tx).await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("one handler should start");
+
+        assert_eq!(started.load(Ordering::SeqCst), 1);
     }
 }

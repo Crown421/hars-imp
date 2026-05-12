@@ -10,6 +10,7 @@
 use std::io::ErrorKind;
 use std::io::Write;
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +23,7 @@ use tokio::time::timeout;
 use hars_imp::components::button::ButtonComponent;
 use hars_imp::components::registry::ComponentRegistry;
 use hars_imp::components::switch::SwitchComponent;
-use hars_imp::components::trait_def::Component;
+use hars_imp::components::trait_def::{Component, OutboundMessage};
 use hars_imp::config::{ButtonConfig, Config, SwitchConfig};
 use hars_imp::mqtt::client::{MqttClient, MqttEvent};
 use hars_imp::mqtt::discovery::DeviceDiscoveryBuilder;
@@ -34,8 +35,9 @@ use hars_imp::util::helpers::slugify;
 
 /// An ephemeral mosquitto broker for testing.
 struct TestBroker {
-    child: Child,
+    child: Option<Child>,
     port: u16,
+    config_path: PathBuf,
     _config_dir: tempfile::TempDir,
 }
 
@@ -50,13 +52,7 @@ impl TestBroker {
         writeln!(f, "listener {port}\nallow_anonymous true\nlog_dest stderr")
             .expect("write config");
 
-        let child = match Command::new("mosquitto")
-            .arg("-c")
-            .arg(&config_path)
-            .stderr(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-        {
+        let child = match start_mosquitto(&config_path, port) {
             Ok(child) => child,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 eprintln!("Skipping MQTT integration test: mosquitto is not on PATH");
@@ -65,27 +61,31 @@ impl TestBroker {
             Err(e) => panic!("Failed to start mosquitto: {e}"),
         };
 
-        // Wait for the broker to start accepting connections.
-        let start = std::time::Instant::now();
-        loop {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                break;
-            }
-            if start.elapsed() > Duration::from_secs(5) {
-                panic!("mosquitto did not start within 5s on port {port}");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
         Some(Self {
-            child,
+            child: Some(child),
             port,
+            config_path,
             _config_dir: config_dir,
         })
     }
 
     fn port(&self) -> u16 {
         self.port
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn restart(&mut self) {
+        self.stop();
+        self.child = Some(
+            start_mosquitto(&self.config_path, self.port)
+                .expect("restart mosquitto on existing test port"),
+        );
     }
 }
 
@@ -100,9 +100,31 @@ macro_rules! broker_or_skip {
 
 impl Drop for TestBroker {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
     }
+}
+
+fn start_mosquitto(config_path: &Path, port: u16) -> std::io::Result<Child> {
+    let child = Command::new("mosquitto")
+        .arg("-c")
+        .arg(config_path)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()?;
+
+    // Wait for the broker to start accepting connections.
+    let start = std::time::Instant::now();
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("mosquitto did not start within 5s on port {port}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    Ok(child)
 }
 
 /// Find a free TCP port by binding to port 0.
@@ -203,7 +225,10 @@ async fn publish_via_action_channel_reaches_subscriber() {
 
     // Publish via the action channel.
     action_tx
-        .send(("test/topic".to_string(), "hello integration".to_string()))
+        .send(OutboundMessage::command_result(
+            "test/topic",
+            "hello integration",
+        ))
         .await
         .expect("send action");
 
@@ -288,6 +313,113 @@ async fn inbound_message_forwarded_as_event() {
         }
         _ => panic!("Expected Message event"),
     }
+}
+
+/// Test: MqttClient reconnects after broker interruption and can publish again.
+#[tokio::test]
+async fn broker_restart_recovers_publish_path() {
+    let mut broker = broker_or_skip!();
+    let config = test_config(broker.port());
+    let mqtt_client = MqttClient::new(&config).expect("create MqttClient");
+
+    let (event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(100);
+    let (action_tx, action_rx) = mpsc::channel(100);
+
+    tokio::spawn(mqtt_client.run(event_tx, action_rx));
+    wait_for_connected(&mut event_rx).await;
+
+    broker.stop();
+    wait_for_disconnected(&mut event_rx).await;
+    broker.restart();
+    wait_for_connected(&mut event_rx).await;
+
+    let (sub_client, mut sub_eventloop) = helper_mqtt_client(broker.port(), "restart-sub");
+    wait_for_helper_connected(&mut sub_eventloop).await;
+    sub_client
+        .subscribe("restart/test", QoS::AtLeastOnce)
+        .await
+        .expect("subscribe after broker restart");
+    wait_for_suback(&mut sub_eventloop).await;
+
+    action_tx
+        .send(OutboundMessage::command_result(
+            "restart/test",
+            "after restart",
+        ))
+        .await
+        .expect("send action after restart");
+
+    let received = timeout(Duration::from_secs(3), async {
+        loop {
+            let event = sub_eventloop.poll().await.expect("sub poll");
+            if let Event::Incoming(Packet::Publish(publish)) = event {
+                return (
+                    publish.topic,
+                    String::from_utf8_lossy(&publish.payload).to_string(),
+                );
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for publish after broker restart");
+
+    assert_eq!(received.0, "restart/test");
+    assert_eq!(received.1, "after restart");
+}
+
+/// Test: buffered publishes larger than rumqttc's request channel flush after reconnect.
+#[tokio::test]
+async fn broker_restart_flushes_large_buffer_without_hanging() {
+    let mut broker = broker_or_skip!();
+    let config = test_config(broker.port());
+    let mqtt_client = MqttClient::new(&config).expect("create MqttClient");
+
+    let (event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(100);
+    let (action_tx, action_rx) = mpsc::channel(200);
+
+    tokio::spawn(mqtt_client.run(event_tx, action_rx));
+    wait_for_connected(&mut event_rx).await;
+
+    broker.stop();
+    wait_for_disconnected(&mut event_rx).await;
+
+    for i in 0..75 {
+        action_tx
+            .send(OutboundMessage::discovery(
+                format!("buffered/{i}"),
+                format!("payload-{i}"),
+            ))
+            .await
+            .expect("send buffered discovery");
+    }
+
+    broker.restart();
+    wait_for_connected(&mut event_rx).await;
+
+    let (sub_client, mut sub_eventloop) = helper_mqtt_client(broker.port(), "buffered-sub");
+    wait_for_helper_connected(&mut sub_eventloop).await;
+    sub_client
+        .subscribe("buffered/74", QoS::AtLeastOnce)
+        .await
+        .expect("subscribe to retained buffered publish");
+    wait_for_suback(&mut sub_eventloop).await;
+
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            let event = sub_eventloop.poll().await.expect("sub poll");
+            if let Event::Incoming(Packet::Publish(publish)) = event {
+                return (
+                    publish.topic,
+                    String::from_utf8_lossy(&publish.payload).to_string(),
+                );
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for retained buffered publish after broker restart");
+
+    assert_eq!(received.0, "buffered/74");
+    assert_eq!(received.1, "payload-74");
 }
 
 /// Test: Full component lifecycle — register components, build discovery JSON,
@@ -795,4 +927,48 @@ async fn wait_for_connected(event_rx: &mut mpsc::Receiver<MqttEvent>) {
     .await;
 
     assert!(connected.is_ok(), "MqttClient did not connect within 5s");
+}
+
+async fn wait_for_disconnected(event_rx: &mut mpsc::Receiver<MqttEvent>) {
+    let disconnected = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(evt) = event_rx.recv().await {
+                if matches!(evt, MqttEvent::Disconnected(_)) {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        disconnected.is_ok(),
+        "MqttClient did not report disconnect within 10s"
+    );
+}
+
+async fn wait_for_helper_connected(eventloop: &mut rumqttc::EventLoop) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = eventloop.poll().await.expect("helper poll");
+            if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("helper client did not connect within 5s");
+}
+
+async fn wait_for_suback(eventloop: &mut rumqttc::EventLoop) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = eventloop.poll().await.expect("helper poll");
+            if matches!(event, Event::Incoming(Packet::SubAck(_))) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("helper subscription was not acknowledged within 5s");
 }
