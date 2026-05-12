@@ -158,6 +158,11 @@ impl Config {
         if self.mqtt_url.trim().is_empty() {
             return Err(ConfigError::Validation("mqtt_url cannot be empty".into()));
         }
+        if self.update_interval_secs == 0 {
+            return Err(ConfigError::Validation(
+                "update_interval_secs must be greater than zero".into(),
+            ));
+        }
 
         let mut component_slugs = HashSet::new();
         for btn in &self.button {
@@ -339,6 +344,23 @@ password = "p"
         assert!(
             msg.contains("mqtt_url"),
             "Error should mention mqtt_url: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_update_interval_must_be_greater_than_zero() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+update_interval_secs = 0
+"#;
+        let err = load_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("update_interval_secs"),
+            "Error should mention update_interval_secs: {msg}"
         );
     }
 
