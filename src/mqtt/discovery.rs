@@ -189,7 +189,7 @@ mod tests {
         Config {
             hostname: "testhost".to_string(),
             mqtt_url: "mqtt.example.com".to_string(),
-            mqtt_port: 1883,
+            mqtt_port: None,
             username: "user".to_string(),
             password: "pass".to_string(),
             log_level: "info".to_string(),

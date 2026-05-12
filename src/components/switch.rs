@@ -28,6 +28,9 @@ pub struct SwitchComponent {
 
     /// Current state, protected for interior mutability.
     state: Mutex<bool>,
+
+    /// Serializes command handling so rapid ON/OFF messages cannot complete out of order.
+    action_lock: Mutex<()>,
 }
 
 impl SwitchComponent {
@@ -50,6 +53,7 @@ impl SwitchComponent {
             state_topic: format!("homeassistant/switch/{hostname}/{slug}/state"),
             action,
             state: Mutex::new(false),
+            action_lock: Mutex::new(()),
         }
     }
 
@@ -100,6 +104,7 @@ impl Component for SwitchComponent {
         };
 
         info!("Switch '{}' → {payload}", self.name);
+        let _action_guard = self.action_lock.lock().await;
 
         let success = match &self.action {
             SwitchAction::Exec(cmd) => {
@@ -190,8 +195,14 @@ mod tests {
     #[test]
     fn switch_topics() {
         let sw = test_switch();
-        assert_eq!(sw.command_topic, "homeassistant/switch/myhost/night_light/set");
-        assert_eq!(sw.state_topic, "homeassistant/switch/myhost/night_light/state");
+        assert_eq!(
+            sw.command_topic,
+            "homeassistant/switch/myhost/night_light/set"
+        );
+        assert_eq!(
+            sw.state_topic,
+            "homeassistant/switch/myhost/night_light/state"
+        );
     }
 
     #[test]
@@ -286,7 +297,10 @@ mod tests {
 
         // State should remain OFF, no message published
         assert!(!*sw.state.lock().await);
-        assert!(rx.try_recv().is_err(), "No state should be published for unknown payload");
+        assert!(
+            rx.try_recv().is_err(),
+            "No state should be published for unknown payload"
+        );
     }
 
     #[tokio::test]

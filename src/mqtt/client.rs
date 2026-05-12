@@ -1,6 +1,14 @@
+use std::io::{BufReader, Cursor};
+use std::sync::Arc;
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport};
+use rumqttc::tokio_rustls::rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer},
+    ClientConfig, RootCertStore,
+};
+use rumqttc::{
+    AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, TlsConfiguration, Transport,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -28,7 +36,7 @@ pub enum MqttEvent {
 
 impl MqttClient {
     /// Create a new MQTT client from config.
-    pub fn new(config: &Config) -> Result<Self, MqttError> {
+    pub fn new(config: &Config) -> Result<Self, Box<MqttError>> {
         let port = config.effective_mqtt_port();
         let mut opts = MqttOptions::new(&config.hostname, &config.mqtt_url, port);
         opts.set_credentials(&config.username, &config.password);
@@ -136,33 +144,80 @@ async fn handle_event(event: Event, event_tx: &mpsc::Sender<MqttEvent>) {
 }
 
 /// Build a `rumqttc::Transport` from the user's TLS configuration.
-fn build_tls_transport(tls: &crate::config::TlsConfig) -> Result<Transport, MqttError> {
-    // Read the CA certificate, or use system roots.
-    let ca = match &tls.ca_file {
-        Some(path) => std::fs::read(path)
-            .map_err(|e| MqttError::Tls(format!("Failed to read CA file '{path}': {e}")))?,
-        None => {
-            // No custom CA — use system native root certificates.
-            // `Transport::tls_with_default_config()` uses rustls-native-certs.
-            return Ok(Transport::tls_with_default_config());
-        }
-    };
+fn build_tls_transport(tls: &crate::config::TlsConfig) -> Result<Transport, Box<MqttError>> {
+    let root_store = build_root_store(tls)?;
+    let config_builder = ClientConfig::builder().with_root_certificates(root_store);
 
-    // Read optional client certificate + key for mTLS.
-    let client_auth = match (&tls.client_cert, &tls.client_key) {
+    let client_config = match (&tls.client_cert, &tls.client_key) {
         (Some(cert_path), Some(key_path)) => {
-            let cert = std::fs::read(cert_path).map_err(|e| {
-                MqttError::Tls(format!("Failed to read client cert '{cert_path}': {e}"))
-            })?;
-            let key = std::fs::read(key_path).map_err(|e| {
-                MqttError::Tls(format!("Failed to read client key '{key_path}': {e}"))
-            })?;
-            Some((cert, key))
+            let cert = std::fs::read(cert_path)
+                .map_err(|e| tls_error(format!("Failed to read client cert '{cert_path}': {e}")))?;
+            let key = std::fs::read(key_path)
+                .map_err(|e| tls_error(format!("Failed to read client key '{key_path}': {e}")))?;
+
+            let certs = parse_pem_certs(cert_path, cert)?;
+            let key = parse_private_key(key_path, key)?;
+
+            config_builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| tls_error(format!("Invalid TLS client authentication config: {e}")))?
         }
-        _ => None,
+        _ => config_builder.with_no_client_auth(),
     };
 
-    Ok(Transport::tls(ca, client_auth, None))
+    Ok(Transport::tls_with_config(TlsConfiguration::Rustls(
+        Arc::new(client_config),
+    )))
+}
+
+fn build_root_store(tls: &crate::config::TlsConfig) -> Result<RootCertStore, Box<MqttError>> {
+    let mut roots = RootCertStore::empty();
+
+    if let Some(path) = &tls.ca_file {
+        let ca = std::fs::read(path)
+            .map_err(|e| tls_error(format!("Failed to read CA file '{path}': {e}")))?;
+        let certs = parse_pem_certs(path, ca)?;
+        let (added, _) = roots.add_parsable_certificates(certs);
+        if added == 0 {
+            return Err(tls_error(format!(
+                "No valid CA certificates found in '{path}'"
+            )));
+        }
+    } else {
+        let certs = rustls_native_certs::load_native_certs()
+            .map_err(|e| tls_error(format!("Failed to load native root certificates: {e}")))?;
+        let (added, _) = roots.add_parsable_certificates(certs);
+        if added == 0 {
+            return Err(tls_error("No native root certificates could be loaded"));
+        }
+    }
+
+    Ok(roots)
+}
+
+fn parse_pem_certs(
+    path: &str,
+    bytes: Vec<u8>,
+) -> Result<Vec<CertificateDer<'static>>, Box<MqttError>> {
+    let certs = rustls_pemfile::certs(&mut BufReader::new(Cursor::new(bytes)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| tls_error(format!("Failed to parse certificates in '{path}': {e}")))?;
+
+    if certs.is_empty() {
+        return Err(tls_error(format!("No certificates found in '{path}'")));
+    }
+
+    Ok(certs)
+}
+
+fn parse_private_key(path: &str, bytes: Vec<u8>) -> Result<PrivateKeyDer<'static>, Box<MqttError>> {
+    rustls_pemfile::private_key(&mut BufReader::new(Cursor::new(bytes)))
+        .map_err(|e| tls_error(format!("Failed to parse private key '{path}': {e}")))?
+        .ok_or_else(|| tls_error(format!("No private key found in '{path}'")))
+}
+
+fn tls_error(message: impl Into<String>) -> Box<MqttError> {
+    Box::new(MqttError::Tls(message.into()))
 }
 
 /// Publish a message with retain flag.

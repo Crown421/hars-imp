@@ -23,14 +23,14 @@ pub async fn send_notification(
         .call(
             "Notify",
             &(
-                "hars-imp",    // app_name
-                0u32,          // replaces_id
-                "",            // app_icon
-                summary,       // summary
-                body,          // body
+                "hars-imp",           // app_name
+                0u32,                 // replaces_id
+                "",                   // app_icon
+                summary,              // summary
+                body,                 // body
                 Vec::<String>::new(), // actions
-                hints,         // hints
-                -1i32,         // expire_timeout (-1 = default)
+                hints,                // hints
+                -1i32,                // expire_timeout (-1 = default)
             ),
         )
         .await?;

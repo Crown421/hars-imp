@@ -1,8 +1,10 @@
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::info;
 
 use crate::error::ConfigError;
+use crate::util::helpers::slugify;
 
 /// Top-level application configuration, loaded from TOML.
 #[derive(Debug, Clone, Deserialize)]
@@ -14,8 +16,11 @@ pub struct Config {
     pub mqtt_url: String,
 
     /// MQTT broker port.
-    #[serde(default = "default_mqtt_port")]
-    pub mqtt_port: u16,
+    ///
+    /// `None` means the user omitted the port, allowing TLS configs to default
+    /// to 8883 while non-TLS configs default to 1883.
+    #[serde(default)]
+    pub mqtt_port: Option<u16>,
 
     /// MQTT username.
     pub username: String,
@@ -147,13 +152,20 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.hostname.is_empty() {
+        if self.hostname.trim().is_empty() {
             return Err(ConfigError::Validation("hostname cannot be empty".into()));
         }
-        if self.mqtt_url.is_empty() {
+        if self.mqtt_url.trim().is_empty() {
             return Err(ConfigError::Validation("mqtt_url cannot be empty".into()));
         }
+
+        let mut component_slugs = HashSet::new();
+        for btn in &self.button {
+            validate_component_name("button", &btn.name, &mut component_slugs)?;
+        }
+
         for sw in &self.switch {
+            validate_component_name("switch", &sw.name, &mut component_slugs)?;
             if sw.exec.is_none() && sw.dbus.is_none() {
                 return Err(ConfigError::Validation(format!(
                     "Switch '{}' must have either 'exec' or 'dbus' defined",
@@ -183,16 +195,13 @@ impl Config {
 
     /// Returns the effective MQTT port.
     ///
-    /// If the user did not explicitly set `mqtt_port`, this returns 8883
-    /// when TLS is enabled and 1883 otherwise.
+    /// If the user omitted `mqtt_port`, this returns 8883 when TLS is enabled
+    /// and 1883 otherwise. Explicit ports are always preserved as-is.
     pub fn effective_mqtt_port(&self) -> u16 {
-        // If the port was explicitly set in config, use it as-is.
-        // We detect the "default" case by checking if it equals the
-        // serde default (1883) *and* TLS is enabled.
-        if self.mqtt_port == default_mqtt_port() && self.tls.is_some() {
-            default_mqtt_tls_port()
-        } else {
-            self.mqtt_port
+        match self.mqtt_port {
+            Some(port) => port,
+            None if self.tls.is_some() => default_mqtt_tls_port(),
+            None => default_mqtt_port(),
         }
     }
 
@@ -212,6 +221,34 @@ impl Config {
     pub fn status_topic(&self) -> String {
         format!("{}/status", self.device_base_topic())
     }
+}
+
+fn validate_component_name(
+    kind: &str,
+    name: &str,
+    slugs: &mut HashSet<String>,
+) -> Result<(), ConfigError> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{kind} name cannot be empty"
+        )));
+    }
+
+    let slug = slugify(trimmed_name);
+    if slug.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{kind} '{name}' must contain at least one alphanumeric character"
+        )));
+    }
+
+    if !slugs.insert(slug.clone()) {
+        return Err(ConfigError::Validation(format!(
+            "Duplicate component slug '{slug}' from {kind} '{name}'"
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -247,7 +284,8 @@ password = "pass"
     #[test]
     fn defaults_applied() {
         let config = load_toml(MINIMAL_CONFIG).unwrap();
-        assert_eq!(config.mqtt_port, 1883);
+        assert_eq!(config.mqtt_port, None);
+        assert_eq!(config.effective_mqtt_port(), 1883);
         assert_eq!(config.log_level, "info");
         assert_eq!(config.update_interval_secs, 60);
         assert!(config.button.is_empty());
@@ -267,7 +305,7 @@ log_level = "debug"
 update_interval_secs = 10
 "#;
         let config = load_toml(toml).unwrap();
-        assert_eq!(config.mqtt_port, 9999);
+        assert_eq!(config.mqtt_port, Some(9999));
         assert_eq!(config.log_level, "debug");
         assert_eq!(config.update_interval_secs, 10);
     }
@@ -343,6 +381,70 @@ method = "Toggle"
         let err = load_toml(toml).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("both"), "Error should mention both: {msg}");
+    }
+
+    #[test]
+    fn validation_button_name_cannot_be_empty() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[[button]]
+name = "   "
+exec = "echo hi"
+"#;
+        let err = load_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("button name"),
+            "Error should mention button name: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_component_name_must_slugify() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[[button]]
+name = "---"
+exec = "echo hi"
+"#;
+        let err = load_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("alphanumeric"),
+            "Error should mention alphanumeric content: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_duplicate_component_slugs_rejected() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[[button]]
+name = "Night Light"
+exec = "echo hi"
+
+[[switch]]
+name = "Night-Light"
+exec = "true"
+"#;
+        let err = load_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Duplicate component slug"),
+            "Error should mention duplicate slug: {msg}"
+        );
     }
 
     #[test]
@@ -447,6 +549,22 @@ mqtt_port = 9999
         let config = load_toml(toml).unwrap();
         // Explicitly set port overrides auto-detection
         assert_eq!(config.effective_mqtt_port(), 9999);
+    }
+
+    #[test]
+    fn effective_mqtt_port_explicit_1883_with_tls() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+mqtt_port = 1883
+
+[tls]
+"#;
+        let config = load_toml(toml).unwrap();
+        assert_eq!(config.mqtt_port, Some(1883));
+        assert_eq!(config.effective_mqtt_port(), 1883);
     }
 
     #[test]

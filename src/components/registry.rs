@@ -80,7 +80,13 @@ impl ComponentRegistry {
     ) {
         let targets = self.components_for_topic(topic);
         for component in targets {
-            component.handle_message(topic, payload, action_tx).await;
+            let topic = topic.to_string();
+            let payload = payload.to_string();
+            let action_tx = action_tx.clone();
+
+            tokio::spawn(async move {
+                component.handle_message(&topic, &payload, &action_tx).await;
+            });
         }
     }
 
@@ -92,10 +98,17 @@ impl ComponentRegistry {
     }
 }
 
+impl Default for ComponentRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mqtt::discovery::{ComponentType, HomeAssistantComponent};
+    use std::time::Duration;
 
     /// A minimal mock component for registry tests.
     struct MockComponent {
@@ -138,6 +151,48 @@ mod tests {
             _payload: &str,
             _action_tx: &mpsc::Sender<ActionMessage>,
         ) {
+        }
+
+        fn spawn_polling(
+            self: Arc<Self>,
+            _action_tx: mpsc::Sender<ActionMessage>,
+            _shutdown: CancellationToken,
+        ) -> Option<JoinHandle<()>> {
+            None
+        }
+
+        async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
+    }
+
+    struct SlowComponent;
+
+    #[async_trait::async_trait]
+    impl Component for SlowComponent {
+        fn name(&self) -> &str {
+            "slow"
+        }
+
+        fn discovery_component(&self) -> HomeAssistantComponent {
+            HomeAssistantComponent {
+                name: "slow".to_string(),
+                unique_id: "slow".to_string(),
+                component_type: ComponentType::Button {
+                    command_topic: "topic/a".to_string(),
+                },
+            }
+        }
+
+        fn subscriptions(&self) -> Vec<String> {
+            vec!["topic/a".to_string()]
+        }
+
+        async fn handle_message(
+            &self,
+            _topic: &str,
+            _payload: &str,
+            _action_tx: &mpsc::Sender<ActionMessage>,
+        ) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
         fn spawn_polling(
@@ -253,5 +308,23 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         // Should not panic — dispatches to the mock component
         registry.route_message("topic/a", "PRESS", &tx).await;
+    }
+
+    #[tokio::test]
+    async fn route_message_does_not_wait_for_slow_handlers() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(Arc::new(SlowComponent));
+
+        let (tx, _rx) = mpsc::channel(16);
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            registry.route_message("topic/a", "PRESS", &tx),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "routing should not wait for handler completion"
+        );
     }
 }

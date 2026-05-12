@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tokio::signal;
@@ -44,7 +45,7 @@ impl Orchestrator {
         let (event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(100);
 
         // --- Create MQTT client ---
-        let mqtt_client = MqttClient::new(&self.config).map_err(Box::new)?;
+        let mqtt_client = MqttClient::new(&self.config)?;
         let mqtt_async_client = mqtt_client.client();
 
         // --- Set up D-Bus power monitoring ---
@@ -85,13 +86,6 @@ impl Orchestrator {
             publish_retained(&mqtt_async_client, &self.config.status_topic(), "offline").await
         {
             warn!("Failed to publish offline status: {e}");
-        }
-
-        // Publish empty discovery to remove device from HA.
-        if let Err(e) =
-            publish_retained(&mqtt_async_client, &self.config.discovery_topic(), "").await
-        {
-            warn!("Failed to clear discovery: {e}");
         }
 
         // Give MQTT a moment to flush.
@@ -150,15 +144,29 @@ impl Orchestrator {
         &self,
         registry: &ComponentRegistry,
     ) -> Result<String, crate::error::AppError> {
-        let components = registry
-            .components()
-            .iter()
-            .map(|c| {
-                let key = slugify(c.name());
-                let discovery = c.discovery_component();
-                (key, discovery)
-            })
-            .collect::<Vec<_>>();
+        let mut seen_keys = HashSet::new();
+        let mut components = Vec::new();
+
+        for component in registry.components() {
+            let key = slugify(component.name());
+            if key.is_empty() {
+                return Err(crate::error::ComponentError::DiscoveryConflict(format!(
+                    "component '{}' produced an empty discovery key",
+                    component.name()
+                ))
+                .into());
+            }
+
+            if !seen_keys.insert(key.clone()) {
+                return Err(crate::error::ComponentError::DiscoveryConflict(format!(
+                    "duplicate discovery key '{key}' from component '{}'",
+                    component.name()
+                ))
+                .into());
+            }
+
+            components.push((key, component.discovery_component()));
+        }
 
         let discovery = DeviceDiscoveryBuilder::new(&self.config)
             .add_components(components)

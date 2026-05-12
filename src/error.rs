@@ -65,4 +65,7 @@ pub enum ComponentError {
 
     #[error("Invalid payload: {0}")]
     InvalidPayload(String),
+
+    #[error("Discovery conflict: {0}")]
+    DiscoveryConflict(String),
 }

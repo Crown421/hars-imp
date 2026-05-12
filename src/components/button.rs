@@ -111,7 +111,10 @@ mod tests {
     #[test]
     fn button_command_topic() {
         let btn = test_button();
-        assert_eq!(btn.command_topic, "homeassistant/button/myhost/lock_screen/set");
+        assert_eq!(
+            btn.command_topic,
+            "homeassistant/button/myhost/lock_screen/set"
+        );
     }
 
     #[test]

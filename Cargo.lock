@@ -371,7 +371,10 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
+ "libc",
  "rumqttc",
+ "rustls-native-certs",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sysinfo",

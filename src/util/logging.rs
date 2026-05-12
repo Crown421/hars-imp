@@ -1,11 +1,10 @@
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 
 /// Initialize the tracing subscriber with the given log level.
 ///
 /// Respects `RUST_LOG` env var if set, otherwise uses the config level.
 pub fn init(log_level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
     fmt()
         .with_env_filter(filter)
