@@ -157,6 +157,12 @@ fn helper_mqtt_client(port: u16, client_id: &str) -> (AsyncClient, rumqttc::Even
     AsyncClient::new(opts, 50)
 }
 
+async fn connected_helper_client(port: u16, client_id: &str) -> (AsyncClient, rumqttc::EventLoop) {
+    let (client, mut eventloop) = helper_mqtt_client(port, client_id);
+    wait_for_helper_connected(&mut eventloop).await;
+    (client, eventloop)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -201,27 +207,8 @@ async fn publish_via_action_channel_reaches_subscriber() {
     // Wait for connection.
     wait_for_connected(&mut event_rx).await;
 
-    // Set up a helper subscriber on the same broker.
-    let (sub_client, mut sub_eventloop) = helper_mqtt_client(broker.port(), "test-sub");
-    // Drive the eventloop until connected, then subscribe.
-    loop {
-        let event = sub_eventloop.poll().await.expect("sub poll");
-        if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
-            break;
-        }
-    }
-    sub_client
-        .subscribe("test/topic", QoS::AtLeastOnce)
-        .await
-        .expect("subscribe");
-
-    // Wait for SubAck.
-    loop {
-        let event = sub_eventloop.poll().await.expect("sub poll");
-        if matches!(event, Event::Incoming(Packet::SubAck(_))) {
-            break;
-        }
-    }
+    let (sub_client, mut sub_eventloop) = connected_helper_client(broker.port(), "test-sub").await;
+    subscribe_and_wait(&sub_client, &mut sub_eventloop, "test/topic").await;
 
     // Publish via the action channel.
     action_tx
@@ -232,20 +219,7 @@ async fn publish_via_action_channel_reaches_subscriber() {
         .await
         .expect("send action");
 
-    // The subscriber should receive the message.
-    let received = timeout(Duration::from_secs(3), async {
-        loop {
-            let event = sub_eventloop.poll().await.expect("sub poll");
-            if let Event::Incoming(Packet::Publish(publish)) = event {
-                return (
-                    publish.topic,
-                    String::from_utf8_lossy(&publish.payload).to_string(),
-                );
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for published message");
+    let received = wait_for_publish(&mut sub_eventloop, None, Duration::from_secs(3)).await;
 
     assert_eq!(received.0, "test/topic");
     assert_eq!(received.1, "hello integration");
@@ -276,43 +250,19 @@ async fn inbound_message_forwarded_as_event() {
     // Give time for the subscription to take effect.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Publish from a helper client.
-    let (pub_client, mut pub_eventloop) = helper_mqtt_client(broker.port(), "test-pub");
-    // Drive until connected.
-    loop {
-        let event = pub_eventloop.poll().await.expect("pub poll");
-        if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
-            break;
-        }
-    }
-    pub_client
-        .publish("inbound/test", QoS::AtLeastOnce, false, b"payload123")
-        .await
-        .expect("publish");
+    let (pub_client, mut pub_eventloop) = connected_helper_client(broker.port(), "test-pub").await;
+    publish_and_flush(
+        &pub_client,
+        &mut pub_eventloop,
+        "inbound/test",
+        false,
+        b"payload123",
+    )
+    .await;
 
-    // Drive the pub eventloop briefly to ensure the message is sent.
-    let _ = timeout(Duration::from_millis(500), pub_eventloop.poll()).await;
-
-    // We should receive an MqttEvent::Message.
-    let event = timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(evt) = event_rx.recv().await {
-                if matches!(&evt, MqttEvent::Message(_, _)) {
-                    return evt;
-                }
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for inbound message event");
-
-    match event {
-        MqttEvent::Message(topic, payload) => {
-            assert_eq!(topic, "inbound/test");
-            assert_eq!(payload, "payload123");
-        }
-        _ => panic!("Expected Message event"),
-    }
+    let event = wait_for_mqtt_message(&mut event_rx, None, Duration::from_secs(3)).await;
+    assert_eq!(event.0, "inbound/test");
+    assert_eq!(event.1, "payload123");
 }
 
 /// Test: MqttClient reconnects after broker interruption and can publish again.
@@ -333,13 +283,9 @@ async fn broker_restart_recovers_publish_path() {
     broker.restart();
     wait_for_connected(&mut event_rx).await;
 
-    let (sub_client, mut sub_eventloop) = helper_mqtt_client(broker.port(), "restart-sub");
-    wait_for_helper_connected(&mut sub_eventloop).await;
-    sub_client
-        .subscribe("restart/test", QoS::AtLeastOnce)
-        .await
-        .expect("subscribe after broker restart");
-    wait_for_suback(&mut sub_eventloop).await;
+    let (sub_client, mut sub_eventloop) =
+        connected_helper_client(broker.port(), "restart-sub").await;
+    subscribe_and_wait(&sub_client, &mut sub_eventloop, "restart/test").await;
 
     action_tx
         .send(OutboundMessage::command_result(
@@ -349,19 +295,7 @@ async fn broker_restart_recovers_publish_path() {
         .await
         .expect("send action after restart");
 
-    let received = timeout(Duration::from_secs(3), async {
-        loop {
-            let event = sub_eventloop.poll().await.expect("sub poll");
-            if let Event::Incoming(Packet::Publish(publish)) = event {
-                return (
-                    publish.topic,
-                    String::from_utf8_lossy(&publish.payload).to_string(),
-                );
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for publish after broker restart");
+    let received = wait_for_publish(&mut sub_eventloop, None, Duration::from_secs(3)).await;
 
     assert_eq!(received.0, "restart/test");
     assert_eq!(received.1, "after restart");
@@ -396,27 +330,11 @@ async fn broker_restart_flushes_large_buffer_without_hanging() {
     broker.restart();
     wait_for_connected(&mut event_rx).await;
 
-    let (sub_client, mut sub_eventloop) = helper_mqtt_client(broker.port(), "buffered-sub");
-    wait_for_helper_connected(&mut sub_eventloop).await;
-    sub_client
-        .subscribe("buffered/74", QoS::AtLeastOnce)
-        .await
-        .expect("subscribe to retained buffered publish");
-    wait_for_suback(&mut sub_eventloop).await;
+    let (sub_client, mut sub_eventloop) =
+        connected_helper_client(broker.port(), "buffered-sub").await;
+    subscribe_and_wait(&sub_client, &mut sub_eventloop, "buffered/74").await;
 
-    let received = timeout(Duration::from_secs(5), async {
-        loop {
-            let event = sub_eventloop.poll().await.expect("sub poll");
-            if let Event::Incoming(Packet::Publish(publish)) = event {
-                return (
-                    publish.topic,
-                    String::from_utf8_lossy(&publish.payload).to_string(),
-                );
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for retained buffered publish after broker restart");
+    let received = wait_for_publish(&mut sub_eventloop, None, Duration::from_secs(5)).await;
 
     assert_eq!(received.0, "buffered/74");
     assert_eq!(received.1, "payload-74");
@@ -531,31 +449,15 @@ async fn full_component_lifecycle() {
     // Give subscriptions time to register.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // --- Verify discovery was published (subscribe from helper and get retained) ---
-    let (sub_client, mut sub_eventloop) = helper_mqtt_client(port, "verify-discovery");
-    loop {
-        let event = sub_eventloop.poll().await.expect("sub poll");
-        if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
-            break;
-        }
-    }
-    sub_client
-        .subscribe(&config.discovery_topic(), QoS::AtLeastOnce)
-        .await
-        .expect("subscribe discovery");
+    let (sub_client, mut sub_eventloop) = connected_helper_client(port, "verify-discovery").await;
+    subscribe_and_wait(&sub_client, &mut sub_eventloop, &config.discovery_topic()).await;
 
-    let discovery_received = timeout(Duration::from_secs(3), async {
-        loop {
-            let event = sub_eventloop.poll().await.expect("sub poll");
-            if let Event::Incoming(Packet::Publish(publish)) = event {
-                if publish.topic == config.discovery_topic() {
-                    return String::from_utf8_lossy(&publish.payload).to_string();
-                }
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for discovery message");
+    let (_, discovery_received) = wait_for_publish(
+        &mut sub_eventloop,
+        Some(&config.discovery_topic()),
+        Duration::from_secs(3),
+    )
+    .await;
 
     let disc_parsed: serde_json::Value =
         serde_json::from_str(&discovery_received).expect("parse discovery JSON");
@@ -567,31 +469,17 @@ async fn full_component_lifecycle() {
         "homeassistant/button/integrationtest/{}/set",
         slugify("Test Lock")
     );
-    let (pub_client, mut pub_eventloop) = helper_mqtt_client(port, "send-press");
-    loop {
-        let event = pub_eventloop.poll().await.expect("pub poll");
-        if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
-            break;
-        }
-    }
-    pub_client
-        .publish(&button_topic, QoS::AtLeastOnce, false, b"PRESS")
-        .await
-        .expect("publish button press");
+    let (pub_client, mut pub_eventloop) = connected_helper_client(port, "send-press").await;
+    publish_and_flush(
+        &pub_client,
+        &mut pub_eventloop,
+        &button_topic,
+        false,
+        b"PRESS",
+    )
+    .await;
 
-    // Drive pub eventloop to flush.
-    let _ = timeout(Duration::from_millis(500), pub_eventloop.poll()).await;
-
-    // The main client should receive this as an MqttEvent::Message.
-    let msg = timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(MqttEvent::Message(topic, payload)) = event_rx.recv().await {
-                return (topic, payload);
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for button press message");
+    let msg = wait_for_mqtt_message(&mut event_rx, None, Duration::from_secs(3)).await;
 
     assert_eq!(msg.0, button_topic);
     assert_eq!(msg.1, "PRESS");
@@ -644,34 +532,16 @@ async fn switch_state_round_trip() {
     // The action_tx should have received a state publish message.
     // It goes through action_rx into the MQTT client, which publishes it.
     // Then we should see it back as an inbound message (since we're subscribed).
-    let state_msg = timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(MqttEvent::Message(topic, payload)) = event_rx.recv().await {
-                if topic == state_topic {
-                    return payload;
-                }
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for switch state ON");
+    let (_, state_msg) =
+        wait_for_mqtt_message(&mut event_rx, Some(&state_topic), Duration::from_secs(3)).await;
 
     assert_eq!(state_msg, "ON");
 
     // Now send OFF.
     switch.handle_message("ignored", "OFF", &action_tx).await;
 
-    let state_msg = timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(MqttEvent::Message(topic, payload)) = event_rx.recv().await {
-                if topic == state_topic {
-                    return payload;
-                }
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for switch state OFF");
+    let (_, state_msg) =
+        wait_for_mqtt_message(&mut event_rx, Some(&state_topic), Duration::from_secs(3)).await;
 
     assert_eq!(state_msg, "OFF");
 }
@@ -714,31 +584,13 @@ async fn on_resume_publishes_switch_state() {
     switch.handle_message("ignored", "ON", &action_tx).await;
 
     // Consume the ON state publish.
-    let _ = timeout(Duration::from_secs(2), async {
-        loop {
-            if let Some(MqttEvent::Message(topic, _)) = event_rx.recv().await {
-                if topic == state_topic {
-                    return;
-                }
-            }
-        }
-    })
-    .await;
+    let _ = wait_for_mqtt_message(&mut event_rx, Some(&state_topic), Duration::from_secs(2)).await;
 
     // Now simulate resume — should re-publish ON.
     switch.on_resume(&action_tx).await;
 
-    let state_msg = timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(MqttEvent::Message(topic, payload)) = event_rx.recv().await {
-                if topic == state_topic {
-                    return payload;
-                }
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for resume state");
+    let (_, state_msg) =
+        wait_for_mqtt_message(&mut event_rx, Some(&state_topic), Duration::from_secs(3)).await;
 
     assert_eq!(state_msg, "ON");
 }
@@ -793,50 +645,34 @@ async fn registry_routes_mqtt_messages_to_components() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Publish ON from a helper client.
-    let (pub_client, mut pub_eventloop) = helper_mqtt_client(port, "route-pub");
-    loop {
-        let event = pub_eventloop.poll().await.expect("pub poll");
-        if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
-            break;
-        }
-    }
-    pub_client
-        .publish(&switch_cmd_topic, QoS::AtLeastOnce, false, b"ON")
-        .await
-        .expect("publish ON");
-
-    // Drive pub eventloop.
-    let _ = timeout(Duration::from_millis(500), pub_eventloop.poll()).await;
+    let (pub_client, mut pub_eventloop) = connected_helper_client(port, "route-pub").await;
+    publish_and_flush(
+        &pub_client,
+        &mut pub_eventloop,
+        &switch_cmd_topic,
+        false,
+        b"ON",
+    )
+    .await;
 
     // Wait for the inbound message.
-    let (topic, payload) = timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(MqttEvent::Message(t, p)) = event_rx.recv().await {
-                if t == switch_cmd_topic {
-                    return (t, p);
-                }
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for command message");
+    let (topic, payload) = wait_for_mqtt_message(
+        &mut event_rx,
+        Some(&switch_cmd_topic),
+        Duration::from_secs(3),
+    )
+    .await;
 
     // Route through registry.
     registry.route_message(&topic, &payload, &action_tx).await;
 
     // The switch should publish its state via action_tx → MQTT.
-    let state_payload = timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(MqttEvent::Message(t, p)) = event_rx.recv().await {
-                if t == switch_state_topic {
-                    return p;
-                }
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for state response");
+    let (_, state_payload) = wait_for_mqtt_message(
+        &mut event_rx,
+        Some(&switch_state_topic),
+        Duration::from_secs(3),
+    )
+    .await;
 
     assert_eq!(state_payload, "ON");
 }
@@ -848,41 +684,14 @@ async fn retained_messages_persist() {
     let port = broker.port();
 
     // Publish some retained messages from client A.
-    let (pub_client, mut pub_el) = helper_mqtt_client(port, "retain-pub");
-    loop {
-        let event = pub_el.poll().await.expect("pub poll");
-        if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
-            break;
-        }
-    }
+    let (pub_client, mut pub_el) = connected_helper_client(port, "retain-pub").await;
 
-    pub_client
-        .publish("retained/topic1", QoS::AtLeastOnce, true, b"value1")
-        .await
-        .expect("publish retained 1");
-    pub_client
-        .publish("retained/topic2", QoS::AtLeastOnce, true, b"value2")
-        .await
-        .expect("publish retained 2");
-
-    // Drive the eventloop to flush publishes.
-    for _ in 0..5 {
-        let _ = timeout(Duration::from_millis(200), pub_el.poll()).await;
-    }
+    publish_and_flush(&pub_client, &mut pub_el, "retained/topic1", true, b"value1").await;
+    publish_and_flush(&pub_client, &mut pub_el, "retained/topic2", true, b"value2").await;
 
     // New subscriber should receive retained messages.
-    let (sub_client, mut sub_el) = helper_mqtt_client(port, "retain-sub");
-    loop {
-        let event = sub_el.poll().await.expect("sub poll");
-        if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
-            break;
-        }
-    }
-
-    sub_client
-        .subscribe("retained/#", QoS::AtLeastOnce)
-        .await
-        .expect("subscribe");
+    let (sub_client, mut sub_el) = connected_helper_client(port, "retain-sub").await;
+    subscribe_and_wait(&sub_client, &mut sub_el, "retained/#").await;
 
     let mut received = std::collections::HashMap::new();
     let result = timeout(Duration::from_secs(3), async {
@@ -960,6 +769,14 @@ async fn wait_for_helper_connected(eventloop: &mut rumqttc::EventLoop) {
     .expect("helper client did not connect within 5s");
 }
 
+async fn subscribe_and_wait(client: &AsyncClient, eventloop: &mut rumqttc::EventLoop, topic: &str) {
+    client
+        .subscribe(topic, QoS::AtLeastOnce)
+        .await
+        .expect("subscribe");
+    wait_for_suback(eventloop).await;
+}
+
 async fn wait_for_suback(eventloop: &mut rumqttc::EventLoop) {
     timeout(Duration::from_secs(5), async {
         loop {
@@ -971,4 +788,58 @@ async fn wait_for_suback(eventloop: &mut rumqttc::EventLoop) {
     })
     .await
     .expect("helper subscription was not acknowledged within 5s");
+}
+
+async fn publish_and_flush(
+    client: &AsyncClient,
+    eventloop: &mut rumqttc::EventLoop,
+    topic: &str,
+    retain: bool,
+    payload: &[u8],
+) {
+    client
+        .publish(topic, QoS::AtLeastOnce, retain, payload)
+        .await
+        .expect("publish");
+    let _ = timeout(Duration::from_millis(500), eventloop.poll()).await;
+}
+
+async fn wait_for_publish(
+    eventloop: &mut rumqttc::EventLoop,
+    expected_topic: Option<&str>,
+    wait: Duration,
+) -> (String, String) {
+    timeout(wait, async {
+        loop {
+            let event = eventloop.poll().await.expect("helper poll");
+            if let Event::Incoming(Packet::Publish(publish)) = event {
+                if expected_topic.is_none_or(|topic| publish.topic == topic) {
+                    return (
+                        publish.topic,
+                        String::from_utf8_lossy(&publish.payload).to_string(),
+                    );
+                }
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for publish")
+}
+
+async fn wait_for_mqtt_message(
+    event_rx: &mut mpsc::Receiver<MqttEvent>,
+    expected_topic: Option<&str>,
+    wait: Duration,
+) -> (String, String) {
+    timeout(wait, async {
+        loop {
+            if let Some(MqttEvent::Message(topic, payload)) = event_rx.recv().await {
+                if expected_topic.is_none_or(|expected| topic == expected) {
+                    return (topic, payload);
+                }
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for MQTT message")
 }

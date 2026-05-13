@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
@@ -9,54 +9,29 @@ use tracing::warn;
 use super::trait_def::{ActionMessage, Component};
 
 const DEFAULT_HANDLER_LIMIT: usize = 64;
-const DEFAULT_ROUTE_QUEUE_CAPACITY: usize = 16;
 
 /// Manages a collection of components and provides O(1) topic-based routing.
 pub struct ComponentRegistry {
     /// Maximum number of inbound component handlers that may run concurrently.
     handler_permits: Arc<Semaphore>,
 
-    /// Maximum number of pending messages per component/topic route.
-    route_queue_capacity: usize,
-
     /// All registered components.
     components: Vec<Arc<dyn Component>>,
 
-    /// Maps MQTT topic → component/topic route workers.
-    topic_map: HashMap<String, Vec<RouteDispatch>>,
-}
-
-struct RouteDispatch {
-    component_idx: usize,
-    queue: Arc<RouteQueue>,
-}
-
-struct RouteQueue {
-    sender: Mutex<Option<mpsc::Sender<InboundMessage>>>,
-}
-
-struct InboundMessage {
-    topic: String,
-    payload: String,
-    action_tx: mpsc::Sender<ActionMessage>,
+    /// Maps MQTT topic → subscribed components.
+    topic_map: HashMap<String, Vec<Arc<dyn Component>>>,
 }
 
 impl ComponentRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
-        Self::with_limits(DEFAULT_HANDLER_LIMIT, DEFAULT_ROUTE_QUEUE_CAPACITY)
+        Self::with_handler_limit(DEFAULT_HANDLER_LIMIT)
     }
 
     /// Create a registry with a custom inbound handler concurrency limit.
     pub fn with_handler_limit(handler_limit: usize) -> Self {
-        Self::with_limits(handler_limit, DEFAULT_ROUTE_QUEUE_CAPACITY)
-    }
-
-    /// Create a registry with custom inbound handler and route queue limits.
-    pub fn with_limits(handler_limit: usize, route_queue_capacity: usize) -> Self {
         Self {
             handler_permits: Arc::new(Semaphore::new(handler_limit)),
-            route_queue_capacity: route_queue_capacity.max(1),
             components: Vec::new(),
             topic_map: HashMap::new(),
         }
@@ -64,15 +39,11 @@ impl ComponentRegistry {
 
     /// Register a component. Builds the topic routing index.
     pub fn register(&mut self, component: Arc<dyn Component>) {
-        let idx = self.components.len();
         for topic in component.subscriptions() {
             self.topic_map
                 .entry(topic)
                 .or_default()
-                .push(RouteDispatch {
-                    component_idx: idx,
-                    queue: Arc::new(RouteQueue::new()),
-                });
+                .push(Arc::clone(&component));
         }
         self.components.push(component);
     }
@@ -85,10 +56,7 @@ impl ComponentRegistry {
     /// Find components subscribed to a given topic.
     pub fn components_for_topic(&self, topic: &str) -> Vec<Arc<dyn Component>> {
         match self.topic_map.get(topic) {
-            Some(routes) => routes
-                .iter()
-                .map(|route| Arc::clone(&self.components[route.component_idx]))
-                .collect(),
+            Some(components) => components.iter().map(Arc::clone).collect(),
             None => Vec::new(),
         }
     }
@@ -125,34 +93,28 @@ impl ComponentRegistry {
             return;
         };
 
-        for route in routes {
-            let component = Arc::clone(&self.components[route.component_idx]);
-            let sender = route.queue.sender(
-                Arc::clone(&component),
-                Arc::clone(&self.handler_permits),
-                self.route_queue_capacity,
-            );
-            let message = InboundMessage {
-                topic: topic.to_string(),
-                payload: payload.to_string(),
-                action_tx: action_tx.clone(),
-            };
+        for component in routes {
+            let component = Arc::clone(component);
+            let handler_permits = Arc::clone(&self.handler_permits);
+            let topic = topic.to_string();
+            let payload = payload.to_string();
+            let action_tx = action_tx.clone();
 
-            match sender.try_send(message) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        "Dropping inbound MQTT message for '{}' because its handler queue is full",
-                        component.name()
-                    );
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    warn!(
-                        "Dropping inbound MQTT message for '{}' because its handler queue is closed",
-                        component.name()
-                    );
-                }
-            }
+            tokio::spawn(async move {
+                let permit = match handler_permits.try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(
+                            "Dropping inbound MQTT message for '{}' because handler concurrency limit is exhausted",
+                            component.name()
+                        );
+                        return;
+                    }
+                };
+
+                let _permit = permit;
+                component.handle_message(&topic, &payload, &action_tx).await;
+            });
         }
     }
 
@@ -161,55 +123,6 @@ impl ComponentRegistry {
         for component in &self.components {
             component.on_resume(action_tx).await;
         }
-    }
-}
-
-impl RouteQueue {
-    fn new() -> Self {
-        Self {
-            sender: Mutex::new(None),
-        }
-    }
-
-    fn sender(
-        &self,
-        component: Arc<dyn Component>,
-        handler_permits: Arc<Semaphore>,
-        capacity: usize,
-    ) -> mpsc::Sender<InboundMessage> {
-        let mut sender = self.sender.lock().expect("route queue lock poisoned");
-        if let Some(sender) = sender.as_ref() {
-            return sender.clone();
-        }
-
-        let (tx, rx) = mpsc::channel(capacity);
-        tokio::spawn(route_worker(component, handler_permits, rx));
-        *sender = Some(tx.clone());
-        tx
-    }
-}
-
-async fn route_worker(
-    component: Arc<dyn Component>,
-    handler_permits: Arc<Semaphore>,
-    mut rx: mpsc::Receiver<InboundMessage>,
-) {
-    while let Some(message) = rx.recv().await {
-        let permit = match Arc::clone(&handler_permits).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                warn!(
-                    "Dropping inbound MQTT message for '{}' because handler concurrency limit is exhausted",
-                    component.name()
-                );
-                continue;
-            }
-        };
-
-        let _permit = permit;
-        component
-            .handle_message(&message.topic, &message.payload, &message.action_tx)
-            .await;
     }
 }
 
@@ -268,16 +181,6 @@ mod tests {
             _action_tx: &mpsc::Sender<ActionMessage>,
         ) {
         }
-
-        fn spawn_polling(
-            self: Arc<Self>,
-            _action_tx: mpsc::Sender<ActionMessage>,
-            _shutdown: CancellationToken,
-        ) -> Option<JoinHandle<()>> {
-            None
-        }
-
-        async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
     }
 
     struct SlowComponent;
@@ -310,16 +213,6 @@ mod tests {
         ) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-
-        fn spawn_polling(
-            self: Arc<Self>,
-            _action_tx: mpsc::Sender<ActionMessage>,
-            _shutdown: CancellationToken,
-        ) -> Option<JoinHandle<()>> {
-            None
-        }
-
-        async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
     }
 
     struct CountingSlowComponent {
@@ -356,16 +249,6 @@ mod tests {
             self.started.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-
-        fn spawn_polling(
-            self: Arc<Self>,
-            _action_tx: mpsc::Sender<ActionMessage>,
-            _shutdown: CancellationToken,
-        ) -> Option<JoinHandle<()>> {
-            None
-        }
-
-        async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
     }
 
     struct RecordingComponent {
@@ -402,16 +285,6 @@ mod tests {
             self.records.lock().await.push(payload.to_string());
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-
-        fn spawn_polling(
-            self: Arc<Self>,
-            _action_tx: mpsc::Sender<ActionMessage>,
-            _shutdown: CancellationToken,
-        ) -> Option<JoinHandle<()>> {
-            None
-        }
-
-        async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
     }
 
     #[test]
@@ -537,7 +410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_message_preserves_order_for_same_component_topic() {
+    async fn route_message_dispatches_all_messages_for_same_component_topic() {
         let mut registry = ComponentRegistry::new();
         let records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         registry.register(Arc::new(RecordingComponent {
@@ -559,7 +432,9 @@ mod tests {
         .await
         .expect("both messages should be handled");
 
-        assert_eq!(*records.lock().await, vec!["ON", "OFF"]);
+        let mut handled = records.lock().await.clone();
+        handled.sort();
+        assert_eq!(handled, vec!["OFF", "ON"]);
     }
 
     #[tokio::test]

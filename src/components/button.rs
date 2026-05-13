@@ -1,9 +1,5 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::components::trait_def::{ActionMessage, Component};
@@ -73,18 +69,6 @@ impl Component for ButtonComponent {
             }
         }
     }
-
-    fn spawn_polling(
-        self: Arc<Self>,
-        _action_tx: mpsc::Sender<ActionMessage>,
-        _shutdown: CancellationToken,
-    ) -> Option<JoinHandle<()>> {
-        None // Buttons are event-only.
-    }
-
-    async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {
-        // Buttons have no state to re-publish.
-    }
 }
 
 #[cfg(test)]
@@ -92,6 +76,8 @@ mod tests {
     use super::*;
     use crate::config::ButtonConfig;
     use crate::mqtt::discovery::ComponentType;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
 
     fn test_button() -> ButtonComponent {
         let config = ButtonConfig {

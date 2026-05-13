@@ -1,9 +1,5 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::components::trait_def::{ActionMessage, Component, OutboundMessage};
@@ -138,14 +134,6 @@ impl Component for SwitchComponent {
         self.publish_state(action_tx).await;
     }
 
-    fn spawn_polling(
-        self: Arc<Self>,
-        _action_tx: mpsc::Sender<ActionMessage>,
-        _shutdown: CancellationToken,
-    ) -> Option<JoinHandle<()>> {
-        None // Switches are event-only.
-    }
-
     async fn on_resume(&self, action_tx: &mpsc::Sender<ActionMessage>) {
         self.publish_state(action_tx).await;
     }
@@ -175,6 +163,8 @@ mod tests {
     use super::*;
     use crate::config::SwitchConfig;
     use crate::mqtt::discovery::ComponentType;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
 
     fn test_switch() -> SwitchComponent {
         let config = SwitchConfig {

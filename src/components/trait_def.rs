@@ -95,17 +95,20 @@ pub trait Component: Send + Sync {
 
     /// MQTT topics this component wants to subscribe to.
     /// Return an empty vec for components that only publish.
-    fn subscriptions(&self) -> Vec<String>;
+    fn subscriptions(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Handle an inbound MQTT message on a subscribed topic.
     ///
     /// Use `action_tx` to send outbound MQTT messages (e.g. state updates).
     async fn handle_message(
         &self,
-        topic: &str,
-        payload: &str,
-        action_tx: &mpsc::Sender<ActionMessage>,
-    );
+        _topic: &str,
+        _payload: &str,
+        _action_tx: &mpsc::Sender<ActionMessage>,
+    ) {
+    }
 
     /// Spawn a background polling task for this component.
     ///
@@ -113,12 +116,14 @@ pub trait Component: Send + Sync {
     /// The task should respect the `shutdown` token for cooperative cancellation.
     fn spawn_polling(
         self: Arc<Self>,
-        action_tx: mpsc::Sender<ActionMessage>,
-        shutdown: CancellationToken,
-    ) -> Option<JoinHandle<()>>;
+        _action_tx: mpsc::Sender<ActionMessage>,
+        _shutdown: CancellationToken,
+    ) -> Option<JoinHandle<()>> {
+        None
+    }
 
     /// Called after the system resumes from suspend.
     ///
     /// Components should re-publish their current state.
-    async fn on_resume(&self, action_tx: &mpsc::Sender<ActionMessage>);
+    async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
 }

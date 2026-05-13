@@ -1,10 +1,6 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::components::trait_def::{ActionMessage, Component};
@@ -115,14 +111,4 @@ impl Component for NotificationComponent {
             notification.summary, notification.message
         );
     }
-
-    fn spawn_polling(
-        self: Arc<Self>,
-        _action_tx: mpsc::Sender<ActionMessage>,
-        _shutdown: CancellationToken,
-    ) -> Option<JoinHandle<()>> {
-        None
-    }
-
-    async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
 }

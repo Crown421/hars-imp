@@ -146,14 +146,17 @@ impl MqttClient {
 }
 
 struct PublishBuffer {
-    availability_order: VecDeque<String>,
-    availability: HashMap<String, String>,
-    discovery_order: VecDeque<String>,
-    discovery: HashMap<String, String>,
+    availability: CoalescedQueue,
+    discovery: CoalescedQueue,
     command_results: VecDeque<OutboundMessage>,
-    state_order: VecDeque<String>,
-    states: HashMap<String, String>,
+    states: CoalescedQueue,
     command_result_cap: usize,
+}
+
+#[derive(Default)]
+struct CoalescedQueue {
+    order: VecDeque<String>,
+    messages: HashMap<String, String>,
 }
 
 impl PublishBuffer {
@@ -163,13 +166,10 @@ impl PublishBuffer {
 
     fn with_command_result_cap(command_result_cap: usize) -> Self {
         Self {
-            availability_order: VecDeque::new(),
-            availability: HashMap::new(),
-            discovery_order: VecDeque::new(),
-            discovery: HashMap::new(),
+            availability: CoalescedQueue::new(),
+            discovery: CoalescedQueue::new(),
             command_results: VecDeque::new(),
-            state_order: VecDeque::new(),
-            states: HashMap::new(),
+            states: CoalescedQueue::new(),
             command_result_cap,
         }
     }
@@ -177,23 +177,13 @@ impl PublishBuffer {
     fn push(&mut self, message: OutboundMessage) {
         match message {
             OutboundMessage::State { topic, payload } => {
-                push_coalesced(&mut self.state_order, &mut self.states, topic, payload)
+                self.states.push_back(topic, payload);
             }
             OutboundMessage::Availability { topic, payload } => {
-                push_coalesced(
-                    &mut self.availability_order,
-                    &mut self.availability,
-                    topic,
-                    payload,
-                );
+                self.availability.push_back(topic, payload);
             }
             OutboundMessage::Discovery { topic, payload } => {
-                push_coalesced(
-                    &mut self.discovery_order,
-                    &mut self.discovery,
-                    topic,
-                    payload,
-                );
+                self.discovery.push_back(topic, payload);
             }
             message @ OutboundMessage::CommandResult { .. } => {
                 if self.command_results.len() == self.command_result_cap {
@@ -212,23 +202,13 @@ impl PublishBuffer {
     fn push_front(&mut self, message: OutboundMessage) {
         match message {
             OutboundMessage::State { topic, payload } => {
-                push_coalesced_front(&mut self.state_order, &mut self.states, topic, payload);
+                self.states.push_front(topic, payload);
             }
             OutboundMessage::Availability { topic, payload } => {
-                push_coalesced_front(
-                    &mut self.availability_order,
-                    &mut self.availability,
-                    topic,
-                    payload,
-                );
+                self.availability.push_front(topic, payload);
             }
             OutboundMessage::Discovery { topic, payload } => {
-                push_coalesced_front(
-                    &mut self.discovery_order,
-                    &mut self.discovery,
-                    topic,
-                    payload,
-                );
+                self.discovery.push_front(topic, payload);
             }
             message @ OutboundMessage::CommandResult { .. } => {
                 if self.command_results.len() == self.command_result_cap {
@@ -245,19 +225,11 @@ impl PublishBuffer {
     }
 
     fn pop_next(&mut self) -> Option<OutboundMessage> {
-        if let Some(message) = pop_coalesced(
-            &mut self.availability_order,
-            &mut self.availability,
-            OutboundMessage::availability,
-        ) {
+        if let Some(message) = self.availability.pop_next(OutboundMessage::availability) {
             return Some(message);
         }
 
-        if let Some(message) = pop_coalesced(
-            &mut self.discovery_order,
-            &mut self.discovery,
-            OutboundMessage::discovery,
-        ) {
+        if let Some(message) = self.discovery.pop_next(OutboundMessage::discovery) {
             return Some(message);
         }
 
@@ -265,57 +237,52 @@ impl PublishBuffer {
             return Some(message);
         }
 
-        pop_coalesced(
-            &mut self.state_order,
-            &mut self.states,
-            OutboundMessage::state,
-        )
+        self.states.pop_next(OutboundMessage::state)
     }
 
     fn has_pending(&self) -> bool {
-        !self.availability_order.is_empty()
-            || !self.discovery_order.is_empty()
+        self.availability.has_pending()
+            || self.discovery.has_pending()
             || !self.command_results.is_empty()
-            || !self.state_order.is_empty()
+            || self.states.has_pending()
     }
 }
 
-fn push_coalesced(
-    order: &mut VecDeque<String>,
-    messages: &mut HashMap<String, String>,
-    topic: String,
-    payload: String,
-) {
-    if !messages.contains_key(&topic) {
-        order.push_back(topic.clone());
+impl CoalescedQueue {
+    fn new() -> Self {
+        Self::default()
     }
-    messages.insert(topic, payload);
-}
 
-fn push_coalesced_front(
-    order: &mut VecDeque<String>,
-    messages: &mut HashMap<String, String>,
-    topic: String,
-    payload: String,
-) {
-    if !messages.contains_key(&topic) {
-        order.push_front(topic.clone());
-    }
-    messages.insert(topic, payload);
-}
-
-fn pop_coalesced(
-    order: &mut VecDeque<String>,
-    messages: &mut HashMap<String, String>,
-    build: impl Fn(String, String) -> OutboundMessage,
-) -> Option<OutboundMessage> {
-    while let Some(topic) = order.pop_front() {
-        if let Some(payload) = messages.remove(&topic) {
-            return Some(build(topic, payload));
+    fn push_back(&mut self, topic: String, payload: String) {
+        if !self.messages.contains_key(&topic) {
+            self.order.push_back(topic.clone());
         }
+        self.messages.insert(topic, payload);
     }
 
-    None
+    fn push_front(&mut self, topic: String, payload: String) {
+        if !self.messages.contains_key(&topic) {
+            self.order.push_front(topic.clone());
+        }
+        self.messages.insert(topic, payload);
+    }
+
+    fn pop_next(
+        &mut self,
+        build: impl Fn(String, String) -> OutboundMessage,
+    ) -> Option<OutboundMessage> {
+        while let Some(topic) = self.order.pop_front() {
+            if let Some(payload) = self.messages.remove(&topic) {
+                return Some(build(topic, payload));
+            }
+        }
+
+        None
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.order.is_empty()
+    }
 }
 
 fn drain_available_actions(

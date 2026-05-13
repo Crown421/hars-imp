@@ -24,6 +24,16 @@ pub struct Orchestrator {
     config: Config,
 }
 
+struct MainLoopState<'a> {
+    event_rx: &'a mut mpsc::Receiver<MqttEvent>,
+    power_rx: tokio::sync::broadcast::Receiver<PowerEvent>,
+    registry: &'a ComponentRegistry,
+    action_tx: &'a mpsc::Sender<ActionMessage>,
+    sync_tx: &'a mpsc::Sender<()>,
+    polling_shutdown: &'a mut CancellationToken,
+    polling_handles: &'a mut Vec<JoinHandle<()>>,
+}
+
 impl Orchestrator {
     pub fn new(config: Config) -> Self {
         Self { config }
@@ -81,15 +91,15 @@ impl Orchestrator {
         // --- Main event loop ---
         info!("Entering main event loop");
         let result = self
-            .main_loop(
-                &mut event_rx,
+            .main_loop(MainLoopState {
+                event_rx: &mut event_rx,
                 power_rx,
-                &registry,
-                &action_tx,
-                &sync_tx,
-                &mut polling_shutdown,
-                &mut polling_handles,
-            )
+                registry: &registry,
+                action_tx: &action_tx,
+                sync_tx: &sync_tx,
+                polling_shutdown: &mut polling_shutdown,
+                polling_handles: &mut polling_handles,
+            })
             .await;
 
         // --- Graceful shutdown ---
@@ -199,17 +209,7 @@ impl Orchestrator {
     }
 
     /// The main event loop: select! over MQTT events, power events, and shutdown signals.
-    #[allow(clippy::too_many_arguments)]
-    async fn main_loop(
-        &self,
-        event_rx: &mut mpsc::Receiver<MqttEvent>,
-        mut power_rx: tokio::sync::broadcast::Receiver<PowerEvent>,
-        registry: &ComponentRegistry,
-        action_tx: &mpsc::Sender<ActionMessage>,
-        sync_tx: &mpsc::Sender<()>,
-        polling_shutdown: &mut CancellationToken,
-        polling_handles: &mut Vec<JoinHandle<()>>,
-    ) -> Result<(), crate::error::AppError> {
+    async fn main_loop(&self, mut state: MainLoopState<'_>) -> Result<(), crate::error::AppError> {
         // Set up SIGTERM handler for systemd service deployments.
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("Failed to install SIGTERM handler");
@@ -217,14 +217,14 @@ impl Orchestrator {
         loop {
             tokio::select! {
                 // --- MQTT events ---
-                Some(event) = event_rx.recv() => {
+                Some(event) = state.event_rx.recv() => {
                     match event {
                         MqttEvent::Connected => {
                             info!("MQTT connected — scheduling reconnect synchronization");
-                            request_reconnect_sync(sync_tx);
+                            request_reconnect_sync(state.sync_tx);
                         }
                         MqttEvent::Message(topic, payload) => {
-                            registry.route_message(&topic, &payload, action_tx).await;
+                            state.registry.route_message(&topic, &payload, state.action_tx).await;
                         }
                         MqttEvent::Disconnected(reason) => {
                             warn!("MQTT disconnected: {reason}");
@@ -233,15 +233,15 @@ impl Orchestrator {
                 }
 
                 // --- Power events ---
-                Ok(power_event) = power_rx.recv() => {
+                Ok(power_event) = state.power_rx.recv() => {
                     match power_event {
                         PowerEvent::Suspending => {
                             info!("Handling suspend");
                             // Cancel polling tasks.
-                            polling_shutdown.cancel();
+                            state.polling_shutdown.cancel();
 
                             // Publish suspended status.
-                            let _ = action_tx
+                            let _ = state.action_tx
                                 .send(OutboundMessage::availability(
                                     self.config.status_topic(),
                                     "offline",
@@ -257,15 +257,15 @@ impl Orchestrator {
                             // Create a fresh cancellation token — a child of a
                             // cancelled token is immediately cancelled, so we
                             // must replace the token entirely.
-                            *polling_shutdown = CancellationToken::new();
-                            *polling_handles = registry.spawn_polling_tasks(
-                                action_tx.clone(),
-                                polling_shutdown.clone(),
+                            *state.polling_shutdown = CancellationToken::new();
+                            *state.polling_handles = state.registry.spawn_polling_tasks(
+                                state.action_tx.clone(),
+                                state.polling_shutdown.clone(),
                             );
 
                             // Treat resume like a reconnect/state synchronization event
                             // even if the MQTT connection does not emit a fresh ConnAck.
-                            request_reconnect_sync(sync_tx);
+                            request_reconnect_sync(state.sync_tx);
                         }
                     }
                 }
