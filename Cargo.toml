@@ -41,3 +41,26 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/x86_64-unknown-linux-gnu/release/hars-imp", dest = "/usr/bin/hars-imp", mode = "755" },
+    { source = "packaging/hars-imp.service", dest = "/usr/lib/systemd/user/hars-imp.service", mode = "644" },
+]
+
+post_install_script = """
+if [ $1 -eq 1 ] && [ -x "/usr/lib/systemd/systemd-update-helper" ]; then
+    # Initial installation
+    /usr/lib/systemd/systemd-update-helper install-user-units hars-imp.service || :
+fi
+"""
+
+pre_uninstall_script = """
+if [ $1 -eq 0 ] && [ -x "/usr/lib/systemd/systemd-update-helper" ]; then
+    # Package removal, not upgrade
+    /usr/lib/systemd/systemd-update-helper remove-user-units hars-imp.service || :
+fi
+"""
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"
