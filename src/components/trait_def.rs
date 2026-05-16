@@ -13,6 +13,9 @@ pub enum OutboundMessage {
     /// Replaceable entity state. Multiple pending messages for the same topic may be coalesced.
     State { topic: String, payload: String },
 
+    /// Replaceable retained entity state. Multiple pending messages for the same topic may be coalesced.
+    RetainedState { topic: String, payload: String },
+
     /// Availability/status should be retained and should not be coalesced with state updates.
     Availability { topic: String, payload: String },
 
@@ -38,6 +41,13 @@ impl OutboundMessage {
         }
     }
 
+    pub fn retained_state(topic: impl Into<String>, payload: impl Into<String>) -> Self {
+        Self::RetainedState {
+            topic: topic.into(),
+            payload: payload.into(),
+        }
+    }
+
     pub fn discovery(topic: impl Into<String>, payload: impl Into<String>) -> Self {
         Self::Discovery {
             topic: topic.into(),
@@ -55,6 +65,7 @@ impl OutboundMessage {
     pub fn topic(&self) -> &str {
         match self {
             Self::State { topic, .. }
+            | Self::RetainedState { topic, .. }
             | Self::Availability { topic, .. }
             | Self::Discovery { topic, .. }
             | Self::CommandResult { topic, .. } => topic,
@@ -64,6 +75,7 @@ impl OutboundMessage {
     pub fn payload(&self) -> &str {
         match self {
             Self::State { payload, .. }
+            | Self::RetainedState { payload, .. }
             | Self::Availability { payload, .. }
             | Self::Discovery { payload, .. }
             | Self::CommandResult { payload, .. } => payload,
@@ -71,7 +83,10 @@ impl OutboundMessage {
     }
 
     pub fn retain(&self) -> bool {
-        matches!(self, Self::Availability { .. } | Self::Discovery { .. })
+        matches!(
+            self,
+            Self::RetainedState { .. } | Self::Availability { .. } | Self::Discovery { .. }
+        )
     }
 }
 
@@ -92,6 +107,14 @@ pub trait Component: Send + Sync {
 
     /// Returns the HA discovery configuration fragment for this entity.
     fn discovery_component(&self) -> HomeAssistantComponent;
+
+    /// Returns all HA discovery entries contributed by this component.
+    fn discovery_components(&self) -> Vec<(String, HomeAssistantComponent)> {
+        vec![(
+            crate::util::helpers::slugify(self.name()),
+            self.discovery_component(),
+        )]
+    }
 
     /// MQTT topics this component wants to subscribe to.
     /// Return an empty vec for components that only publish.

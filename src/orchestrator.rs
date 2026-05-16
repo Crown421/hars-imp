@@ -10,14 +10,14 @@ use tracing::{info, warn};
 
 use crate::components::notification::NotificationComponent;
 use crate::components::registry::ComponentRegistry;
-use crate::components::system_monitor::{CpuSensor, DiskUsageSensor, MemorySensor};
+use crate::components::status::{StatusComponent, StatusValue};
+use crate::components::system_monitor::SystemMonitorComponent;
 use crate::components::trait_def::{ActionMessage, Component, OutboundMessage};
 use crate::components::{button::ButtonComponent, switch::SwitchComponent};
 use crate::config::Config;
 use crate::dbus::power::{PowerEvent, PowerMonitorSupervisor};
 use crate::mqtt::client::{publish_retained, subscribe_topics, MqttClient, MqttEvent};
 use crate::mqtt::discovery::DeviceDiscoveryBuilder;
-use crate::util::helpers::slugify;
 
 /// The central coordinator that owns all components and runs the main event loop.
 pub struct Orchestrator {
@@ -110,6 +110,16 @@ impl Orchestrator {
         power_supervisor.shutdown().await;
 
         // Publish offline status.
+        if let Err(e) = publish_retained(
+            &mqtt_async_client,
+            &StatusComponent::state_topic_for(&self.config.hostname),
+            &StatusComponent::payload(StatusValue::Off),
+        )
+        .await
+        {
+            warn!("Failed to publish shutdown status sensor state: {e}");
+        }
+
         if let Err(e) =
             publish_retained(&mqtt_async_client, &self.config.status_topic(), "offline").await
         {
@@ -144,27 +154,18 @@ impl Orchestrator {
         info!("Registering notification component");
         registry.register(notification);
 
-        // Built-in system sensors
-        let cpu = Arc::new(CpuSensor::new(
-            &self.config.hostname,
-            self.config.update_interval_secs,
-        ));
-        let memory = Arc::new(MemorySensor::new(
-            &self.config.hostname,
-            self.config.update_interval_secs,
-        ));
-        info!("Registering CPU and memory sensors");
-        registry.register(cpu);
-        registry.register(memory);
+        // Built-in user-visible status sensor
+        let status = Arc::new(StatusComponent::new(&self.config.hostname));
+        info!("Registering status component");
+        registry.register(status);
 
-        // Built-in disk usage sensor (root partition)
-        let disk = Arc::new(DiskUsageSensor::new(
+        // Built-in system monitor
+        let system_monitor = Arc::new(SystemMonitorComponent::new(
             &self.config.hostname,
             self.config.update_interval_secs,
-            None, // defaults to "/"
         ));
-        info!("Registering disk usage sensor");
-        registry.register(disk);
+        info!("Registering system monitor");
+        registry.register(system_monitor);
     }
 
     /// Build the HA device discovery JSON payload.
@@ -176,24 +177,25 @@ impl Orchestrator {
         let mut components = Vec::new();
 
         for component in registry.components() {
-            let key = slugify(component.name());
-            if key.is_empty() {
-                return Err(crate::error::ComponentError::DiscoveryConflict(format!(
-                    "component '{}' produced an empty discovery key",
-                    component.name()
-                ))
-                .into());
-            }
+            for (key, discovery_component) in component.discovery_components() {
+                if key.is_empty() {
+                    return Err(crate::error::ComponentError::DiscoveryConflict(format!(
+                        "component '{}' produced an empty discovery key",
+                        component.name()
+                    ))
+                    .into());
+                }
 
-            if !seen_keys.insert(key.clone()) {
-                return Err(crate::error::ComponentError::DiscoveryConflict(format!(
-                    "duplicate discovery key '{key}' from component '{}'",
-                    component.name()
-                ))
-                .into());
-            }
+                if !seen_keys.insert(key.clone()) {
+                    return Err(crate::error::ComponentError::DiscoveryConflict(format!(
+                        "duplicate discovery key '{key}' from component '{}'",
+                        component.name()
+                    ))
+                    .into());
+                }
 
-            components.push((key, component.discovery_component()));
+                components.push((key, discovery_component));
+            }
         }
 
         let discovery = DeviceDiscoveryBuilder::new(&self.config)
@@ -240,7 +242,14 @@ impl Orchestrator {
                             // Cancel polling tasks.
                             state.polling_shutdown.cancel();
 
-                            // Publish suspended status.
+                            // Publish suspended status before availability changes.
+                            let _ = state.action_tx
+                                .send(StatusComponent::outbound_message(
+                                    &self.config.hostname,
+                                    StatusValue::Suspended,
+                                ))
+                                .await;
+
                             let _ = state.action_tx
                                 .send(OutboundMessage::availability(
                                     self.config.status_topic(),
@@ -405,10 +414,26 @@ async fn await_task(name: &str, handle: JoinHandle<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    fn test_config() -> Config {
+        Config {
+            hostname: "testhost".to_string(),
+            mqtt_url: "mqtt.example.com".to_string(),
+            mqtt_port: None,
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            log_level: "info".to_string(),
+            update_interval_secs: 60,
+            button: vec![],
+            switch: vec![],
+            tls: None,
+        }
+    }
 
     #[tokio::test]
     async fn reconnect_sync_retries_until_success() {
@@ -435,5 +460,27 @@ mod tests {
         .await;
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn discovery_json_includes_status_sensor() {
+        let config = test_config();
+        let orchestrator = Orchestrator::new(config.clone());
+        let mut registry = ComponentRegistry::new();
+
+        orchestrator.register_components(&mut registry);
+
+        let json = orchestrator
+            .build_discovery_json(&registry)
+            .expect("build discovery json");
+        let parsed: Value = serde_json::from_str(&json).expect("parse discovery");
+        let status = &parsed["cmps"]["testhost_status"];
+
+        assert_eq!(status["unique_id"], "testhost_status");
+        assert_eq!(
+            status["state_topic"],
+            "homeassistant/sensor/testhost/status/state"
+        );
+        assert_eq!(status["value_template"], "{{ value_json.status }}");
     }
 }

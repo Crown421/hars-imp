@@ -149,6 +149,7 @@ struct PublishBuffer {
     availability: CoalescedQueue,
     discovery: CoalescedQueue,
     command_results: VecDeque<OutboundMessage>,
+    retained_states: CoalescedQueue,
     states: CoalescedQueue,
     command_result_cap: usize,
 }
@@ -169,6 +170,7 @@ impl PublishBuffer {
             availability: CoalescedQueue::new(),
             discovery: CoalescedQueue::new(),
             command_results: VecDeque::new(),
+            retained_states: CoalescedQueue::new(),
             states: CoalescedQueue::new(),
             command_result_cap,
         }
@@ -178,6 +180,9 @@ impl PublishBuffer {
         match message {
             OutboundMessage::State { topic, payload } => {
                 self.states.push_back(topic, payload);
+            }
+            OutboundMessage::RetainedState { topic, payload } => {
+                self.retained_states.push_back(topic, payload);
             }
             OutboundMessage::Availability { topic, payload } => {
                 self.availability.push_back(topic, payload);
@@ -203,6 +208,9 @@ impl PublishBuffer {
         match message {
             OutboundMessage::State { topic, payload } => {
                 self.states.push_front(topic, payload);
+            }
+            OutboundMessage::RetainedState { topic, payload } => {
+                self.retained_states.push_front(topic, payload);
             }
             OutboundMessage::Availability { topic, payload } => {
                 self.availability.push_front(topic, payload);
@@ -233,6 +241,13 @@ impl PublishBuffer {
             return Some(message);
         }
 
+        if let Some(message) = self
+            .retained_states
+            .pop_next(OutboundMessage::retained_state)
+        {
+            return Some(message);
+        }
+
         if let Some(message) = self.command_results.pop_front() {
             return Some(message);
         }
@@ -243,6 +258,7 @@ impl PublishBuffer {
     fn has_pending(&self) -> bool {
         self.availability.has_pending()
             || self.discovery.has_pending()
+            || self.retained_states.has_pending()
             || !self.command_results.is_empty()
             || self.states.has_pending()
     }
@@ -493,6 +509,33 @@ mod tests {
         assert_eq!(second.topic(), "discovery/topic");
         assert_eq!(second.payload(), "new");
         assert!(second.retain());
+
+        assert!(buffer.pop_next().is_none());
+    }
+
+    #[test]
+    fn publish_buffer_keeps_retained_state_separate_from_normal_state() {
+        let mut buffer = PublishBuffer::new();
+        buffer.push(OutboundMessage::state("sensor/topic", "volatile"));
+        buffer.push(OutboundMessage::retained_state("sensor/topic", "retained"));
+        buffer.push(OutboundMessage::retained_state(
+            "sensor/topic",
+            "retained-new",
+        ));
+
+        let first = buffer
+            .pop_next()
+            .expect("retained state should publish before normal state");
+        assert_eq!(first.topic(), "sensor/topic");
+        assert_eq!(first.payload(), "retained-new");
+        assert!(first.retain());
+
+        let second = buffer
+            .pop_next()
+            .expect("normal state should remain pending");
+        assert_eq!(second.topic(), "sensor/topic");
+        assert_eq!(second.payload(), "volatile");
+        assert!(!second.retain());
 
         assert!(buffer.pop_next().is_none());
     }

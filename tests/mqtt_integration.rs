@@ -22,6 +22,7 @@ use tokio::time::timeout;
 // Re-export crate types for integration testing.
 use hars_imp::components::button::ButtonComponent;
 use hars_imp::components::registry::ComponentRegistry;
+use hars_imp::components::status::{StatusComponent, StatusValue};
 use hars_imp::components::switch::SwitchComponent;
 use hars_imp::components::trait_def::{Component, OutboundMessage};
 use hars_imp::config::{ButtonConfig, Config, SwitchConfig};
@@ -338,6 +339,84 @@ async fn broker_restart_flushes_large_buffer_without_hanging() {
 
     assert_eq!(received.0, "buffered/74");
     assert_eq!(received.1, "payload-74");
+}
+
+/// Test: startup publishes availability online and retained user-visible status.
+#[tokio::test]
+async fn startup_publishes_availability_and_status_sensor() {
+    let broker = broker_or_skip!();
+    let config = test_config(broker.port());
+    let status = Arc::new(StatusComponent::new(&config.hostname));
+
+    let discovery = DeviceDiscoveryBuilder::new(&config)
+        .add_components(status.discovery_components())
+        .with_status_topic(config.status_topic())
+        .build();
+    let discovery_json = serde_json::to_string(&discovery).expect("serialize discovery");
+
+    let mqtt_client = MqttClient::new(&config).expect("create MqttClient");
+    let async_client = mqtt_client.client();
+
+    let (event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(100);
+    let (action_tx, action_rx) = mpsc::channel(100);
+
+    tokio::spawn(mqtt_client.run(event_tx, action_rx));
+    wait_for_connected(&mut event_rx).await;
+
+    let (sub_client, mut sub_eventloop) =
+        connected_helper_client(broker.port(), "startup-status-sub").await;
+    subscribe_and_wait(&sub_client, &mut sub_eventloop, &config.discovery_topic()).await;
+    subscribe_and_wait(&sub_client, &mut sub_eventloop, &config.status_topic()).await;
+    subscribe_and_wait(
+        &sub_client,
+        &mut sub_eventloop,
+        &StatusComponent::state_topic_for(&config.hostname),
+    )
+    .await;
+
+    async_client
+        .publish(
+            &config.discovery_topic(),
+            QoS::AtLeastOnce,
+            true,
+            discovery_json.as_bytes(),
+        )
+        .await
+        .expect("publish discovery");
+    async_client
+        .publish(&config.status_topic(), QoS::AtLeastOnce, true, b"online")
+        .await
+        .expect("publish availability");
+
+    status.on_resume(&action_tx).await;
+
+    let (_, discovery_received) = wait_for_publish(
+        &mut sub_eventloop,
+        Some(&config.discovery_topic()),
+        Duration::from_secs(3),
+    )
+    .await;
+    let discovery_parsed: serde_json::Value =
+        serde_json::from_str(&discovery_received).expect("parse discovery");
+    assert!(discovery_parsed["cmps"]
+        .get("integrationtest_status")
+        .is_some());
+
+    let (_, availability_payload) = wait_for_publish(
+        &mut sub_eventloop,
+        Some(&config.status_topic()),
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(availability_payload, "online");
+
+    let (_, status_payload) = wait_for_publish(
+        &mut sub_eventloop,
+        Some(&StatusComponent::state_topic_for(&config.hostname)),
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(status_payload, StatusComponent::payload(StatusValue::On));
 }
 
 /// Test: Full component lifecycle — register components, build discovery JSON,
