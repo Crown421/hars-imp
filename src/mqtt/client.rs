@@ -233,18 +233,18 @@ impl PublishBuffer {
     }
 
     fn pop_next(&mut self) -> Option<OutboundMessage> {
+        if let Some(message) = self
+            .retained_states
+            .pop_next(OutboundMessage::retained_state)
+        {
+            return Some(message);
+        }
+
         if let Some(message) = self.availability.pop_next(OutboundMessage::availability) {
             return Some(message);
         }
 
         if let Some(message) = self.discovery.pop_next(OutboundMessage::discovery) {
-            return Some(message);
-        }
-
-        if let Some(message) = self
-            .retained_states
-            .pop_next(OutboundMessage::retained_state)
-        {
             return Some(message);
         }
 
@@ -517,6 +517,7 @@ mod tests {
     fn publish_buffer_keeps_retained_state_separate_from_normal_state() {
         let mut buffer = PublishBuffer::new();
         buffer.push(OutboundMessage::state("sensor/topic", "volatile"));
+        buffer.push(OutboundMessage::availability("status/topic", "offline"));
         buffer.push(OutboundMessage::retained_state("sensor/topic", "retained"));
         buffer.push(OutboundMessage::retained_state(
             "sensor/topic",
@@ -532,10 +533,17 @@ mod tests {
 
         let second = buffer
             .pop_next()
+            .expect("availability should remain pending");
+        assert_eq!(second.topic(), "status/topic");
+        assert_eq!(second.payload(), "offline");
+        assert!(second.retain());
+
+        let third = buffer
+            .pop_next()
             .expect("normal state should remain pending");
-        assert_eq!(second.topic(), "sensor/topic");
-        assert_eq!(second.payload(), "volatile");
-        assert!(!second.retain());
+        assert_eq!(third.topic(), "sensor/topic");
+        assert_eq!(third.payload(), "volatile");
+        assert!(!third.retain());
 
         assert!(buffer.pop_next().is_none());
     }

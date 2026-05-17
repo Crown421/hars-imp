@@ -1,8 +1,8 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -13,62 +13,138 @@ use zbus::Connection;
 #[derive(Debug, Clone)]
 pub enum PowerEvent {
     /// The system is about to suspend.
-    Suspending,
+    Suspending(LogindDelayHold),
 
     /// The system has resumed from suspend.
     Resuming,
+
+    /// The system is about to shut down or reboot.
+    ShuttingDown(LogindDelayHold),
 }
 
-/// Monitors systemd-logind for suspend/resume signals.
+#[derive(Debug, Clone, Copy)]
+enum InhibitorKind {
+    Sleep,
+    Shutdown,
+}
+
+impl InhibitorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sleep => "sleep",
+            Self::Shutdown => "shutdown",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sleep => "sleep",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// Cloneable handle for an active logind delay inhibitor.
+///
+/// Releasing any clone drops the underlying inhibitor FD. The operation is
+/// idempotent because all clones share the same slot.
+#[derive(Debug, Clone)]
+pub struct LogindDelayHold {
+    inhibitor_fd: Arc<Mutex<Option<OwnedFd>>>,
+    label: &'static str,
+}
+
+impl LogindDelayHold {
+    fn new(inhibitor_fd: Arc<Mutex<Option<OwnedFd>>>, label: &'static str) -> Self {
+        Self {
+            inhibitor_fd,
+            label,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(label: &'static str) -> Self {
+        Self::new(Arc::new(Mutex::new(None)), label)
+    }
+
+    pub fn release(&self) {
+        if let Ok(mut guard) = self.inhibitor_fd.lock() {
+            if guard.take().is_some() {
+                info!("Released {} inhibitor", self.label);
+            }
+        }
+    }
+}
+
+/// Monitors systemd-logind for power transition signals.
 ///
 /// Acquires a sleep inhibitor lock (delay mode) so we get time to
 /// clean up before the system actually suspends.
 pub struct PowerMonitor {
     system_conn: Connection,
-    power_tx: broadcast::Sender<PowerEvent>,
+    power_tx: mpsc::Sender<PowerEvent>,
     /// Held inhibitor FD. Dropping releases the lock.
-    inhibitor_fd: Mutex<Option<OwnedFd>>,
+    sleep_inhibitor_fd: Arc<Mutex<Option<OwnedFd>>>,
+    /// Held shutdown inhibitor FD. Dropping releases the lock.
+    shutdown_inhibitor_fd: Arc<Mutex<Option<OwnedFd>>>,
 }
 
 impl PowerMonitor {
     /// Create a new power monitor.
     ///
-    /// Returns the monitor and a broadcast receiver for power events.
+    /// Returns the monitor and a receiver for power events.
     pub async fn new(
         system_conn: Connection,
-    ) -> Result<(Self, broadcast::Receiver<PowerEvent>), crate::error::DbusError> {
-        let (power_tx, power_rx) = broadcast::channel(8);
+    ) -> Result<(Self, mpsc::Receiver<PowerEvent>), crate::error::DbusError> {
+        let (power_tx, power_rx) = mpsc::channel(8);
 
         Ok((Self::with_sender(system_conn, power_tx), power_rx))
     }
 
-    fn with_sender(system_conn: Connection, power_tx: broadcast::Sender<PowerEvent>) -> Self {
+    fn with_sender(system_conn: Connection, power_tx: mpsc::Sender<PowerEvent>) -> Self {
+        Self::with_inhibitors(
+            system_conn,
+            power_tx,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        )
+    }
+
+    fn with_inhibitors(
+        system_conn: Connection,
+        power_tx: mpsc::Sender<PowerEvent>,
+        sleep_inhibitor_fd: Arc<Mutex<Option<OwnedFd>>>,
+        shutdown_inhibitor_fd: Arc<Mutex<Option<OwnedFd>>>,
+    ) -> Self {
         Self {
             system_conn,
             power_tx,
-            inhibitor_fd: Mutex::new(None),
+            sleep_inhibitor_fd,
+            shutdown_inhibitor_fd,
         }
-    }
-
-    /// Get an additional receiver for power events.
-    #[allow(dead_code)]
-    pub fn subscribe(&self) -> broadcast::Receiver<PowerEvent> {
-        self.power_tx.subscribe()
     }
 
     /// Run the power monitoring loop.
     ///
-    /// This listens for `PrepareForSleep` signals from systemd-logind
-    /// and broadcasts `PowerEvent`s.
+    /// This listens for logind prepare signals
+    /// and sends `PowerEvent`s to the orchestrator.
     pub async fn run(self) -> Result<(), crate::error::DbusError> {
         info!("Starting power monitor");
 
-        // Acquire sleep inhibitor (delay mode) so we get a chance to clean up.
-        if let Err(e) = self.acquire_inhibitor().await {
+        if let Err(e) = self
+            .acquire_inhibitor(InhibitorKind::Sleep, "Publish status before sleep")
+            .await
+        {
             warn!("Failed to acquire sleep inhibitor: {e}");
         }
 
-        // Listen for PrepareForSleep signals.
+        if let Err(e) = self
+            .acquire_inhibitor(InhibitorKind::Shutdown, "Publish status before shutdown")
+            .await
+        {
+            warn!("Failed to acquire shutdown inhibitor: {e}");
+        }
+
         let proxy: zbus::Proxy = zbus::proxy::Builder::new(&self.system_conn)
             .destination("org.freedesktop.login1")?
             .path("/org/freedesktop/login1")?
@@ -76,44 +152,87 @@ impl PowerMonitor {
             .build()
             .await?;
 
-        let mut stream = proxy.receive_signal("PrepareForSleep").await?;
+        let mut sleep_stream = proxy.receive_signal("PrepareForSleep").await?;
+        let mut shutdown_stream = proxy.receive_signal("PrepareForShutdown").await?;
 
-        while let Some(signal) = stream.next().await {
-            let body: zbus::message::Body = signal.body();
-            let suspending: bool = match body.deserialize() {
-                Ok(val) => val,
-                Err(e) => {
-                    error!("Failed to deserialize PrepareForSleep signal: {e}");
-                    continue;
+        loop {
+            tokio::select! {
+                signal = sleep_stream.next() => {
+                    let Some(signal) = signal else {
+                        warn!("Power monitor sleep signal stream ended");
+                        return Ok(());
+                    };
+
+                    let body: zbus::message::Body = signal.body();
+                    let suspending: bool = match body.deserialize() {
+                        Ok(val) => val,
+                        Err(e) => {
+                            error!("Failed to deserialize PrepareForSleep signal: {e}");
+                            continue;
+                        }
+                    };
+
+                    self.handle_prepare_for_sleep(suspending).await;
+                }
+
+                signal = shutdown_stream.next() => {
+                    let Some(signal) = signal else {
+                        warn!("Power monitor shutdown signal stream ended");
+                        return Ok(());
+                    };
+
+                    let body: zbus::message::Body = signal.body();
+                    let shutting_down: bool = match body.deserialize() {
+                        Ok(val) => val,
+                        Err(e) => {
+                            error!("Failed to deserialize PrepareForShutdown signal: {e}");
+                            continue;
+                        }
+                    };
+
+                    self.handle_prepare_for_shutdown(shutting_down).await;
                 }
             };
-
-            if suspending {
-                info!("System preparing to suspend");
-                let _ = self.power_tx.send(PowerEvent::Suspending);
-
-                // Release the inhibitor so the system can actually suspend.
-                self.release_inhibitor();
-            } else {
-                info!("System resumed from suspend");
-                let _ = self.power_tx.send(PowerEvent::Resuming);
-
-                // Re-acquire inhibitor after resume.
-                if let Err(e) = self.acquire_inhibitor().await {
-                    warn!("Failed to re-acquire sleep inhibitor after resume: {e}");
-                }
-            }
         }
-
-        warn!("Power monitor signal stream ended");
-        Ok(())
     }
 
-    /// Acquire a delay-mode sleep inhibitor from logind.
+    async fn handle_prepare_for_sleep(&self, suspending: bool) {
+        emit_prepare_for_sleep_event(
+            &self.power_tx,
+            self.delay_hold(InhibitorKind::Sleep),
+            suspending,
+        )
+        .await;
+
+        if !suspending {
+            // Re-acquire inhibitor after resume.
+            if let Err(e) = self
+                .acquire_inhibitor(InhibitorKind::Sleep, "Publish status before sleep")
+                .await
+            {
+                warn!("Failed to re-acquire sleep inhibitor after resume: {e}");
+            }
+        }
+    }
+
+    async fn handle_prepare_for_shutdown(&self, shutting_down: bool) {
+        emit_prepare_for_shutdown_event(
+            &self.power_tx,
+            self.delay_hold(InhibitorKind::Shutdown),
+            shutting_down,
+        )
+        .await;
+    }
+
+    /// Acquire a delay-mode inhibitor from logind.
     ///
-    /// The returned FD is stored in `self.inhibitor_fd`. The lock is held
-    /// until `release_inhibitor()` is called (or the monitor is dropped).
-    async fn acquire_inhibitor(&self) -> Result<(), crate::error::DbusError> {
+    /// The returned FD is stored in the relevant slot. The lock is held until
+    /// the corresponding `LogindDelayHold` is released or the process exits.
+    async fn acquire_inhibitor(
+        &self,
+        kind: InhibitorKind,
+        reason: &str,
+    ) -> Result<(), crate::error::DbusError> {
         let proxy: zbus::Proxy = zbus::proxy::Builder::new(&self.system_conn)
             .destination("org.freedesktop.login1")?
             .path("/org/freedesktop/login1")?
@@ -122,34 +241,75 @@ impl PowerMonitor {
             .await?;
 
         let fd: OwnedFd = proxy
-            .call(
-                "Inhibit",
-                &("sleep", "hars-imp", "Publish status before sleep", "delay"),
-            )
+            .call("Inhibit", &(kind.as_str(), "hars-imp", reason, "delay"))
             .await?;
 
         // Store the FD so it stays alive until we explicitly release it.
-        if let Ok(mut guard) = self.inhibitor_fd.lock() {
+        if let Ok(mut guard) = self.inhibitor_slot(kind).lock() {
             *guard = Some(fd);
         }
 
-        info!("Acquired sleep inhibitor (delay mode)");
+        info!("Acquired {} inhibitor (delay mode)", kind.label());
         Ok(())
     }
 
-    /// Release the sleep inhibitor by dropping the stored FD.
-    fn release_inhibitor(&self) {
-        if let Ok(mut guard) = self.inhibitor_fd.lock() {
-            if guard.take().is_some() {
-                info!("Released sleep inhibitor");
-            }
+    fn inhibitor_slot(&self, kind: InhibitorKind) -> &Arc<Mutex<Option<OwnedFd>>> {
+        match kind {
+            InhibitorKind::Sleep => &self.sleep_inhibitor_fd,
+            InhibitorKind::Shutdown => &self.shutdown_inhibitor_fd,
+        }
+    }
+
+    /// Build a handle that can release the currently held inhibitor.
+    fn delay_hold(&self, kind: InhibitorKind) -> LogindDelayHold {
+        LogindDelayHold::new(Arc::clone(self.inhibitor_slot(kind)), kind.label())
+    }
+}
+
+async fn emit_prepare_for_sleep_event(
+    power_tx: &mpsc::Sender<PowerEvent>,
+    hold: LogindDelayHold,
+    suspending: bool,
+) {
+    if suspending {
+        info!("System preparing to suspend");
+        send_power_event(power_tx, PowerEvent::Suspending(hold)).await;
+    } else {
+        info!("System resumed from suspend");
+        let _ = power_tx.send(PowerEvent::Resuming).await;
+    }
+}
+
+async fn emit_prepare_for_shutdown_event(
+    power_tx: &mpsc::Sender<PowerEvent>,
+    hold: LogindDelayHold,
+    shutting_down: bool,
+) {
+    if shutting_down {
+        info!("System preparing to shut down");
+        send_power_event(power_tx, PowerEvent::ShuttingDown(hold)).await;
+    } else {
+        info!("System shutdown preparation was cancelled");
+    }
+}
+
+async fn send_power_event(power_tx: &mpsc::Sender<PowerEvent>, event: PowerEvent) {
+    let release_on_failure = match &event {
+        PowerEvent::Suspending(hold) | PowerEvent::ShuttingDown(hold) => Some(hold.clone()),
+        PowerEvent::Resuming => None,
+    };
+
+    if power_tx.send(event).await.is_err() {
+        if let Some(hold) = release_on_failure {
+            hold.release();
         }
     }
 }
 
 /// Handle for the supervised power monitor task.
 pub struct PowerMonitorSupervisor {
-    pub receiver: broadcast::Receiver<PowerEvent>,
+    receiver: Option<mpsc::Receiver<PowerEvent>>,
+    shutdown_hold: LogindDelayHold,
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
 }
@@ -157,21 +317,47 @@ pub struct PowerMonitorSupervisor {
 impl PowerMonitorSupervisor {
     /// Spawn a supervised power monitor loop.
     pub fn spawn() -> Self {
-        let (power_tx, receiver) = broadcast::channel(8);
+        let (power_tx, receiver) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
+        let sleep_inhibitor_fd = Arc::new(Mutex::new(None));
+        let shutdown_inhibitor_fd = Arc::new(Mutex::new(None));
+        let shutdown_hold = LogindDelayHold::new(
+            Arc::clone(&shutdown_inhibitor_fd),
+            InhibitorKind::Shutdown.label(),
+        );
         let handle = tokio::spawn(supervise_power_monitor(
             power_tx,
             shutdown.clone(),
             Duration::from_secs(1),
             Duration::from_secs(60),
-            run_power_monitor_once,
+            move |power_tx| {
+                let sleep_inhibitor_fd = Arc::clone(&sleep_inhibitor_fd);
+                let shutdown_inhibitor_fd = Arc::clone(&shutdown_inhibitor_fd);
+                async move {
+                    run_power_monitor_once(power_tx, sleep_inhibitor_fd, shutdown_inhibitor_fd)
+                        .await
+                }
+            },
         ));
 
         Self {
-            receiver,
+            receiver: Some(receiver),
+            shutdown_hold,
             shutdown,
             handle,
         }
+    }
+
+    /// Take the single power-event receiver owned by this supervisor.
+    pub fn take_receiver(&mut self) -> mpsc::Receiver<PowerEvent> {
+        self.receiver
+            .take()
+            .expect("power event receiver should only be taken once")
+    }
+
+    /// Build a handle that releases the process-wide shutdown inhibitor.
+    pub fn shutdown_delay_hold(&self) -> LogindDelayHold {
+        self.shutdown_hold.clone()
     }
 
     /// Cancel the supervisor and wait briefly for it to exit.
@@ -186,22 +372,25 @@ impl PowerMonitorSupervisor {
 }
 
 async fn run_power_monitor_once(
-    power_tx: broadcast::Sender<PowerEvent>,
+    power_tx: mpsc::Sender<PowerEvent>,
+    sleep_inhibitor_fd: Arc<Mutex<Option<OwnedFd>>>,
+    shutdown_inhibitor_fd: Arc<Mutex<Option<OwnedFd>>>,
 ) -> Result<(), crate::error::DbusError> {
     let conn = crate::dbus::client::system_connection().await?;
     info!("D-Bus system connection established for power monitoring");
-    let monitor = PowerMonitor::with_sender(conn, power_tx);
+    let monitor =
+        PowerMonitor::with_inhibitors(conn, power_tx, sleep_inhibitor_fd, shutdown_inhibitor_fd);
     monitor.run().await
 }
 
 async fn supervise_power_monitor<F, Fut>(
-    power_tx: broadcast::Sender<PowerEvent>,
+    power_tx: mpsc::Sender<PowerEvent>,
     shutdown: CancellationToken,
     initial_backoff: Duration,
     max_backoff: Duration,
     mut run_once: F,
 ) where
-    F: FnMut(broadcast::Sender<PowerEvent>) -> Fut,
+    F: FnMut(mpsc::Sender<PowerEvent>) -> Fut,
     Fut: std::future::Future<Output = Result<(), crate::error::DbusError>>,
 {
     let mut attempt: u64 = 1;
@@ -242,14 +431,95 @@ async fn supervise_power_monitor<F, Fut>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::os::fd::OwnedFd as StdOwnedFd;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
 
+    fn held_test_slot() -> Arc<Mutex<Option<OwnedFd>>> {
+        let file = File::open("/dev/null").expect("open /dev/null");
+        let fd: StdOwnedFd = file.into();
+        Arc::new(Mutex::new(Some(OwnedFd::from(fd))))
+    }
+
+    fn empty_test_hold(label: &'static str) -> LogindDelayHold {
+        LogindDelayHold::empty_for_test(label)
+    }
+
+    #[test]
+    fn delay_hold_release_is_idempotent() {
+        let slot = held_test_slot();
+        let hold = LogindDelayHold::new(Arc::clone(&slot), "shutdown");
+
+        assert!(slot.lock().expect("lock slot").is_some());
+
+        hold.release();
+        assert!(slot.lock().expect("lock slot").is_none());
+
+        hold.release();
+        assert!(slot.lock().expect("lock slot").is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_for_shutdown_true_emits_shutdown_event() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let hold = empty_test_hold("shutdown");
+
+        emit_prepare_for_shutdown_event(&tx, hold, true).await;
+
+        let event = rx.recv().await.expect("shutdown event should be sent");
+        assert!(matches!(event, PowerEvent::ShuttingDown(_)));
+    }
+
+    #[tokio::test]
+    async fn prepare_for_shutdown_false_does_not_emit_event() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let hold = empty_test_hold("shutdown");
+
+        emit_prepare_for_shutdown_event(&tx, hold, false).await;
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn prepare_for_sleep_true_emits_suspend_event() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let hold = empty_test_hold("sleep");
+
+        emit_prepare_for_sleep_event(&tx, hold, true).await;
+
+        let event = rx.recv().await.expect("suspend event should be sent");
+        assert!(matches!(event, PowerEvent::Suspending(_)));
+    }
+
+    #[tokio::test]
+    async fn prepare_for_sleep_false_emits_resume_event() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let hold = empty_test_hold("sleep");
+
+        emit_prepare_for_sleep_event(&tx, hold, false).await;
+
+        let event = rx.recv().await.expect("resume event should be sent");
+        assert!(matches!(event, PowerEvent::Resuming));
+    }
+
+    #[tokio::test]
+    async fn failed_shutdown_event_send_releases_hold() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let slot = held_test_slot();
+        let hold = LogindDelayHold::new(Arc::clone(&slot), "shutdown");
+
+        emit_prepare_for_shutdown_event(&tx, hold, true).await;
+
+        assert!(slot.lock().expect("lock slot").is_none());
+    }
+
     #[tokio::test]
     async fn supervisor_restarts_after_monitor_exit() {
-        let (tx, _rx) = broadcast::channel(8);
+        let (tx, _rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_for_task = Arc::clone(&attempts);
@@ -282,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_stops_without_restart_after_shutdown() {
-        let (tx, _rx) = broadcast::channel(8);
+        let (tx, _rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_for_task = Arc::clone(&attempts);

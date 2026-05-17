@@ -12,10 +12,10 @@ use crate::components::notification::NotificationComponent;
 use crate::components::registry::ComponentRegistry;
 use crate::components::status::{StatusComponent, StatusValue};
 use crate::components::system_monitor::SystemMonitorComponent;
-use crate::components::trait_def::{ActionMessage, Component, OutboundMessage};
+use crate::components::trait_def::{ActionMessage, Component};
 use crate::components::{button::ButtonComponent, switch::SwitchComponent};
 use crate::config::Config;
-use crate::dbus::power::{PowerEvent, PowerMonitorSupervisor};
+use crate::dbus::power::{LogindDelayHold, PowerEvent, PowerMonitorSupervisor};
 use crate::mqtt::client::{publish_retained, subscribe_topics, MqttClient, MqttEvent};
 use crate::mqtt::discovery::DeviceDiscoveryBuilder;
 
@@ -26,12 +26,18 @@ pub struct Orchestrator {
 
 struct MainLoopState<'a> {
     event_rx: &'a mut mpsc::Receiver<MqttEvent>,
-    power_rx: tokio::sync::broadcast::Receiver<PowerEvent>,
+    power_rx: mpsc::Receiver<PowerEvent>,
+    mqtt_client: &'a rumqttc::AsyncClient,
     registry: &'a ComponentRegistry,
     action_tx: &'a mpsc::Sender<ActionMessage>,
     sync_tx: &'a mpsc::Sender<()>,
     polling_shutdown: &'a mut CancellationToken,
     polling_handles: &'a mut Vec<JoinHandle<()>>,
+}
+
+enum MainLoopExit {
+    Signal,
+    LogindShutdown(LogindDelayHold),
 }
 
 impl Orchestrator {
@@ -62,8 +68,9 @@ impl Orchestrator {
         let mqtt_async_client = mqtt_client.client();
 
         // --- Set up supervised D-Bus power monitoring ---
-        let power_supervisor = PowerMonitorSupervisor::spawn();
-        let power_rx = power_supervisor.receiver.resubscribe();
+        let mut power_supervisor = PowerMonitorSupervisor::spawn();
+        let power_rx = power_supervisor.take_receiver();
+        let process_shutdown_hold = power_supervisor.shutdown_delay_hold();
 
         // --- Prepare discovery payload ---
         let discovery_json = self.build_discovery_json(&registry)?;
@@ -90,24 +97,28 @@ impl Orchestrator {
 
         // --- Main event loop ---
         info!("Entering main event loop");
-        let result = self
+        let exit = self
             .main_loop(MainLoopState {
                 event_rx: &mut event_rx,
                 power_rx,
+                mqtt_client: &mqtt_async_client,
                 registry: &registry,
                 action_tx: &action_tx,
                 sync_tx: &sync_tx,
                 polling_shutdown: &mut polling_shutdown,
                 polling_handles: &mut polling_handles,
             })
-            .await;
+            .await?;
 
         // --- Graceful shutdown ---
         info!("Shutting down...");
         polling_shutdown.cancel();
         sync_shutdown.cancel();
         await_task("reconnect sync worker", sync_handle).await;
-        power_supervisor.shutdown().await;
+        let shutdown_hold = match exit {
+            MainLoopExit::Signal => process_shutdown_hold,
+            MainLoopExit::LogindShutdown(hold) => hold,
+        };
 
         // Publish offline status.
         if let Err(e) = publish_retained(
@@ -128,9 +139,11 @@ impl Orchestrator {
 
         // Give MQTT a moment to flush.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        shutdown_hold.release();
+        power_supervisor.shutdown().await;
 
         info!("Shutdown complete");
-        result
+        Ok(())
     }
 
     /// Register all components from config + built-ins.
@@ -211,7 +224,10 @@ impl Orchestrator {
     }
 
     /// The main event loop: select! over MQTT events, power events, and shutdown signals.
-    async fn main_loop(&self, mut state: MainLoopState<'_>) -> Result<(), crate::error::AppError> {
+    async fn main_loop(
+        &self,
+        mut state: MainLoopState<'_>,
+    ) -> Result<MainLoopExit, crate::error::AppError> {
         // Set up SIGTERM handler for systemd service deployments.
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("Failed to install SIGTERM handler");
@@ -235,30 +251,32 @@ impl Orchestrator {
                 }
 
                 // --- Power events ---
-                Ok(power_event) = state.power_rx.recv() => {
+                Some(power_event) = state.power_rx.recv() => {
                     match power_event {
-                        PowerEvent::Suspending => {
+                        PowerEvent::Suspending(hold) => {
                             info!("Handling suspend");
                             // Cancel polling tasks.
                             state.polling_shutdown.cancel();
 
-                            // Publish suspended status before availability changes.
-                            let _ = state.action_tx
-                                .send(StatusComponent::outbound_message(
-                                    &self.config.hostname,
-                                    StatusValue::Suspended,
-                                ))
-                                .await;
+                            if let Err(e) = publish_retained(
+                                state.mqtt_client,
+                                &StatusComponent::state_topic_for(&self.config.hostname),
+                                &StatusComponent::payload(StatusValue::Suspended),
+                            )
+                            .await
+                            {
+                                warn!("Failed to publish suspended status sensor state: {e}");
+                            }
 
-                            let _ = state.action_tx
-                                .send(OutboundMessage::availability(
-                                    self.config.status_topic(),
-                                    "offline",
-                                ))
-                                .await;
+                            if let Err(e) =
+                                publish_retained(state.mqtt_client, &self.config.status_topic(), "offline").await
+                            {
+                                warn!("Failed to publish suspend availability status: {e}");
+                            }
 
                             // Give MQTT time to flush.
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            hold.release();
                         }
                         PowerEvent::Resuming => {
                             info!("Handling resume");
@@ -276,17 +294,21 @@ impl Orchestrator {
                             // even if the MQTT connection does not emit a fresh ConnAck.
                             request_reconnect_sync(state.sync_tx);
                         }
+                        PowerEvent::ShuttingDown(hold) => {
+                            info!("Received logind shutdown preparation signal");
+                            return Ok(MainLoopExit::LogindShutdown(hold));
+                        }
                     }
                 }
 
                 // --- Shutdown signals ---
                 _ = signal::ctrl_c() => {
                     info!("Received SIGINT, shutting down");
-                    return Ok(());
+                    return Ok(MainLoopExit::Signal);
                 }
                 _ = sigterm.recv() => {
                     info!("Received SIGTERM, shutting down");
-                    return Ok(());
+                    return Ok(MainLoopExit::Signal);
                 }
             }
         }
@@ -347,6 +369,15 @@ async fn reconnect_sync_once(
     publish_retained(client, &config.status_topic(), "online")
         .await
         .map_err(Box::new)?;
+
+    // Publish user-visible status directly so lifecycle transitions stay ordered.
+    publish_retained(
+        client,
+        &StatusComponent::state_topic_for(&config.hostname),
+        &StatusComponent::payload(StatusValue::On),
+    )
+    .await
+    .map_err(Box::new)?;
 
     // Publish current state for all stateful components (e.g. switches).
     registry.notify_resume(action_tx).await;
@@ -460,6 +491,45 @@ mod tests {
         .await;
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn main_loop_exits_on_logind_shutdown_event() {
+        let config = test_config();
+        let orchestrator = Orchestrator::new(config);
+        let registry = ComponentRegistry::new();
+        let (event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(1);
+        let (power_tx, power_rx) = mpsc::channel::<PowerEvent>(1);
+        let (action_tx, _action_rx) = mpsc::channel::<ActionMessage>(1);
+        let (sync_tx, _sync_rx) = mpsc::channel::<()>(1);
+        let mut polling_shutdown = CancellationToken::new();
+        let mut polling_handles = Vec::new();
+        let mqtt_options = rumqttc::MqttOptions::new("test-main-loop", "localhost", 1883);
+        let (mqtt_client, _eventloop) = rumqttc::AsyncClient::new(mqtt_options, 1);
+
+        power_tx
+            .send(PowerEvent::ShuttingDown(LogindDelayHold::empty_for_test(
+                "shutdown",
+            )))
+            .await
+            .expect("queue shutdown event");
+
+        let exit = orchestrator
+            .main_loop(MainLoopState {
+                event_rx: &mut event_rx,
+                power_rx,
+                mqtt_client: &mqtt_client,
+                registry: &registry,
+                action_tx: &action_tx,
+                sync_tx: &sync_tx,
+                polling_shutdown: &mut polling_shutdown,
+                polling_handles: &mut polling_handles,
+            })
+            .await
+            .expect("main loop should exit cleanly");
+
+        assert!(matches!(exit, MainLoopExit::LogindShutdown(_)));
+        drop(event_tx);
     }
 
     #[test]

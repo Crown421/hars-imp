@@ -74,14 +74,7 @@ impl Component for StatusComponent {
         vec![(self.discovery_key.clone(), self.discovery_component())]
     }
 
-    async fn on_resume(&self, action_tx: &mpsc::Sender<ActionMessage>) {
-        let _ = action_tx
-            .send(OutboundMessage::retained_state(
-                self.state_topic.clone(),
-                Self::payload(StatusValue::On),
-            ))
-            .await;
-    }
+    async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
 }
 
 #[cfg(test)]
