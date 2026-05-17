@@ -33,11 +33,11 @@ src/
 │
 ├── components/
 │   ├── mod.rs                  # Re-exports
-│   ├── trait_def.rs            # Component trait + ActionMessage/EventMessage types
+│   ├── trait_def.rs            # Component trait + outbound ActionMessage type
 │   ├── registry.rs             # ComponentRegistry: topic→component routing
 │   ├── button.rs               # ButtonComponent (config-driven, shell exec on PRESS)
 │   ├── switch.rs               # SwitchComponent (shell exec or D-Bus method call)
-│   ├── system_monitor.rs       # CPU, RAM sensors via sysinfo
+│   ├── system_monitor.rs       # CPU, memory, disk sensors via sysinfo
 │   └── notification.rs         # NotificationComponent (MQTT JSON → D-Bus notify)
 │
 └── util/
@@ -63,7 +63,10 @@ pub trait Component: Send + Sync {
     fn discovery_component(&self) -> HomeAssistantComponent;
 
     /// MQTT topics this component wants to receive messages from.
-    fn subscriptions(&self) -> Vec<String>;
+    /// Defaults to an empty list for publish-only components.
+    fn subscriptions(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Handle an inbound MQTT message. Use action_tx to publish responses.
     async fn handle_message(
@@ -71,7 +74,8 @@ pub trait Component: Send + Sync {
         topic: &str,
         payload: &str,
         action_tx: &mpsc::Sender<ActionMessage>,
-    );
+    ) {
+    }
 
     /// For polled components (sensors): spawn a background task.
     /// Returns None for event-only components.
@@ -79,10 +83,12 @@ pub trait Component: Send + Sync {
         self: Arc<Self>,
         action_tx: mpsc::Sender<ActionMessage>,
         shutdown: CancellationToken,
-    ) -> Option<JoinHandle<()>>;
+    ) -> Option<JoinHandle<()>> {
+        None
+    }
 
     /// Called after resume from suspend. Re-publish current state.
-    async fn on_resume(&self, action_tx: &mpsc::Sender<ActionMessage>);
+    async fn on_resume(&self, action_tx: &mpsc::Sender<ActionMessage>) {}
 }
 ```
 
@@ -90,39 +96,41 @@ pub trait Component: Send + Sync {
 
 ```
 ┌──────────────┐  action_tx   ┌──────────────┐  publish   ┌──────────────┐
-│  Components  │ ───────────► │ Orchestrator  │ ─────────► │  MQTT Broker │
-│  (sensors,   │              │  (main loop)  │            │              │
-│   handlers)  │ ◄─────────── │               │ ◄───────── │              │
+│  Components  │ ───────────► │  MqttClient  │ ─────────► │  MQTT Broker │
+│  (sensors,   │              │  event loop  │            │              │
+│   handlers)  │ ◄─────────── │              │ ◄───────── │              │
 └──────────────┘  MqttEvent   └──────────────┘  subscribe  └──────────────┘
-                                     ▲
-                                     │ power_rx
-                              ┌──────────────┐
-                              │ D-Bus Power  │
-                              │   Monitor    │
-                              └──────────────┘
+        ▲                            ▲
+        │ route_message              │ sync requests
+        └──────────────┬─────────────┘
+                       │
+                ┌──────────────┐
+                │ Orchestrator │ ◄── power_rx ── D-Bus Power Monitor
+                └──────────────┘
 ```
 
-- **ActionMessage** `(String, String)` — (topic, payload) for outbound MQTT. Components send these.
+- **ActionMessage** `OutboundMessage` — typed outbound MQTT publish request. Components send these.
 - **MqttEvent** `{Connected, Message(String, String), Disconnected(String)}` — inbound MQTT events. Orchestrator routes `Message` variants to components.
 - **PowerEvent** `{Suspending, Resuming}` — broadcast from D-Bus power monitor.
 
 ### Orchestrator (`orchestrator.rs`)
 
-The orchestrator owns the main `tokio::select!` loop with four arms:
+The orchestrator owns the main `tokio::select!` loop with three concerns:
 
-1. **MQTT event loop poll** — forwards incoming publishes to matching component's `handle_message()`
-2. **Action channel drain** — publishes outbound messages from components
-3. **Power event receiver** — handles suspend (cleanup, release inhibitor) and resume (reconnect, rediscover)
-4. **Shutdown signal** — SIGINT/SIGTERM → graceful cleanup
+1. **MQTT events** — schedules reconnect synchronization or routes incoming publishes to matching components
+2. **Power events** — handles suspend/resume by stopping and restarting polling work and scheduling synchronization
+3. **Shutdown signals** — SIGINT/SIGTERM → graceful cleanup
+
+The `MqttClient` owns the MQTT poll loop, outbound action drain, reconnect backoff, and coalescing publish buffer.
 
 ### Discovery Protocol
 
 Uses HA MQTT Device Discovery v2 (single device-based message):
 
-1. At startup, collect `discovery_component()` from every registered component
+1. At startup/reconnect, collect `discovery_component()` from every registered component
 2. Assemble into a single `HomeAssistantDeviceDiscovery` with device info + origin + components map
 3. Publish to `homeassistant/device/{hostname}/config` with `retain = true`, `QoS::AtLeastOnce`
-4. On shutdown, publish empty payload to same topic (cleanup)
+4. Publish retained availability on the status topic so HA can track online/offline state
 
 ### MQTT Reconnection Strategy
 
@@ -136,13 +144,14 @@ Uses HA MQTT Device Discovery v2 (single device-based message):
 ```
 PrepareForSleep(true) from logind
   → PowerEvent::Suspending via broadcast
-  → Orchestrator: publish "Suspended", cancel sensor tasks, release sleep inhibitor
+  → Orchestrator: publish "offline", cancel sensor tasks
   → System suspends
 
 PrepareForSleep(false) from logind
   → PowerEvent::Resuming via broadcast
-  → Orchestrator: reconnect D-Bus (3 retries), reacquire inhibitor,
-    reconnect MQTT, re-publish discovery, restart sensor tasks, publish "Online"
+  → Orchestrator: restart sensor tasks, request reconnect synchronization
+  → Reconnect sync worker: re-publish discovery, re-subscribe topics,
+    publish "online", re-publish current component state
 ```
 
 ## Configuration

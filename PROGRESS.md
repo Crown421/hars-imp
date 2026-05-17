@@ -60,8 +60,8 @@ This document tracks implementation status for the `take-2` rewrite. Each sectio
 | `cargo check` passes | ✅ | Zero warnings, all modules compile |
 | `cargo build` passes | ✅ | Full debug build succeeds |
 | Manual testing | ⬜ | Requires MQTT broker + HA instance |
-| Unit tests | ✅ | 63 tests across 6 modules (config, registry, button, switch, helpers, discovery) |
-| Integration tests | ✅ | 8 tests with ephemeral mosquitto broker (`tests/mqtt_integration.rs`) |
+| Unit tests | ✅ | 80 tests across core modules |
+| Integration tests | ✅ | 10 tests with ephemeral mosquitto broker (`tests/mqtt_integration.rs`) |
 
 ---
 
@@ -93,7 +93,7 @@ This document tracks implementation status for the `take-2` rewrite. Each sectio
 - [x] Add SIGTERM handling (`tokio::signal::unix::signal(SignalKind::terminate())`) — added SIGTERM arm to `select!` loop alongside SIGINT
 - [x] Cache D-Bus session connection — shared `OnceCell<Connection>` in `dbus/client.rs`; `notification.rs` and `switch.rs` now use cached connection
 - [x] Command execution timeouts — `execute_command()` in `button.rs` now enforces a 30-second timeout via `tokio::time::timeout`
-- [x] Switch state query on startup — `on_mqtt_connected()` now calls `notify_resume()` to publish initial component states (including switch OFF)
+- [x] Switch state publish on startup/reconnect — reconnect synchronization calls `notify_resume()` to publish initial component states (including switch OFF)
 
 ### P2 — Code Quality & Refactoring
 - [x] Move `slugify()` and `execute_command()` out of `button.rs` into `util/helpers.rs` — both are now shared by `button.rs`, `switch.rs`, and `orchestrator.rs`
@@ -106,6 +106,6 @@ This document tracks implementation status for the `take-2` rewrite. Each sectio
 - [ ] Secret management (password not in plaintext config) — options proposed, awaiting decision
 
 ### P4 — Testing
-- [x] Unit tests — config parsing/validation, `ComponentRegistry` routing, `handle_message` with known payloads, `slugify` edge cases, discovery JSON serialization round-trip (63 tests across 6 modules)
-- [x] Integration tests with mosquitto broker — MQTT connect/pub/sub round-trip, discovery publishing, component lifecycle, switch state round-trip, resume state, retained messages, registry routing end-to-end (8 tests in `tests/mqtt_integration.rs`)
+- [x] Unit tests — config parsing/validation, `ComponentRegistry` routing, `handle_message` with known payloads, `slugify` edge cases, discovery JSON serialization round-trip, MQTT publish buffering
+- [x] Integration tests with mosquitto broker — MQTT connect/pub/sub round-trip, discovery publishing, component lifecycle, switch state round-trip, resume state, retained messages, registry routing end-to-end, broker restart recovery
 - [ ] Manual testing — requires MQTT broker + HA instance
