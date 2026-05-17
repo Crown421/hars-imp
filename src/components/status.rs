@@ -1,7 +1,6 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 
-use crate::components::trait_def::{ActionMessage, Component, OutboundMessage};
+use crate::components::trait_def::Component;
 use crate::mqtt::discovery::{ComponentType, HomeAssistantComponent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,10 +43,6 @@ impl StatusComponent {
     pub fn payload(status: StatusValue) -> String {
         format!(r#"{{"status":"{}"}}"#, status.as_str())
     }
-
-    pub fn outbound_message(hostname: &str, status: StatusValue) -> OutboundMessage {
-        OutboundMessage::retained_state(Self::state_topic_for(hostname), Self::payload(status))
-    }
 }
 
 #[async_trait]
@@ -73,8 +68,6 @@ impl Component for StatusComponent {
     fn discovery_components(&self) -> Vec<(String, HomeAssistantComponent)> {
         vec![(self.discovery_key.clone(), self.discovery_component())]
     }
-
-    async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
 }
 
 #[cfg(test)]

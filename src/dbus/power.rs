@@ -20,6 +20,9 @@ pub enum PowerEvent {
 
     /// The system is about to shut down or reboot.
     ShuttingDown(LogindDelayHold),
+
+    /// A previously requested shutdown or reboot was cancelled.
+    ShutdownCancelled,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -30,13 +33,6 @@ enum InhibitorKind {
 
 impl InhibitorKind {
     fn as_str(self) -> &'static str {
-        match self {
-            Self::Sleep => "sleep",
-            Self::Shutdown => "shutdown",
-        }
-    }
-
-    fn label(self) -> &'static str {
         match self {
             Self::Sleep => "sleep",
             Self::Shutdown => "shutdown",
@@ -68,10 +64,16 @@ impl LogindDelayHold {
     }
 
     pub fn release(&self) {
-        if let Ok(mut guard) = self.inhibitor_fd.lock() {
-            if guard.take().is_some() {
-                info!("Released {} inhibitor", self.label);
-            }
+        let Ok(mut guard) = self.inhibitor_fd.lock() else {
+            warn!(
+                "Failed to release {} inhibitor because the inhibitor state lock is poisoned",
+                self.label
+            );
+            return;
+        };
+
+        if guard.take().is_some() {
+            info!("Released {} inhibitor", self.label);
         }
     }
 }
@@ -131,19 +133,10 @@ impl PowerMonitor {
     pub async fn run(self) -> Result<(), crate::error::DbusError> {
         info!("Starting power monitor");
 
-        if let Err(e) = self
-            .acquire_inhibitor(InhibitorKind::Sleep, "Publish status before sleep")
-            .await
-        {
-            warn!("Failed to acquire sleep inhibitor: {e}");
-        }
-
-        if let Err(e) = self
-            .acquire_inhibitor(InhibitorKind::Shutdown, "Publish status before shutdown")
-            .await
-        {
-            warn!("Failed to acquire shutdown inhibitor: {e}");
-        }
+        self.acquire_inhibitor(InhibitorKind::Sleep, "Publish status before sleep")
+            .await?;
+        self.acquire_inhibitor(InhibitorKind::Shutdown, "Publish status before shutdown")
+            .await?;
 
         let proxy: zbus::Proxy = zbus::proxy::Builder::new(&self.system_conn)
             .destination("org.freedesktop.login1")?
@@ -154,6 +147,7 @@ impl PowerMonitor {
 
         let mut sleep_stream = proxy.receive_signal("PrepareForSleep").await?;
         let mut shutdown_stream = proxy.receive_signal("PrepareForShutdown").await?;
+        let mut shutdown_prepare_active = false;
 
         loop {
             tokio::select! {
@@ -172,7 +166,7 @@ impl PowerMonitor {
                         }
                     };
 
-                    self.handle_prepare_for_sleep(suspending).await;
+                    self.handle_prepare_for_sleep(suspending).await?;
                 }
 
                 signal = shutdown_stream.next() => {
@@ -190,13 +184,27 @@ impl PowerMonitor {
                         }
                     };
 
-                    self.handle_prepare_for_shutdown(shutting_down).await;
+                    if shutting_down {
+                        shutdown_prepare_active = true;
+                        self.handle_prepare_for_shutdown(true).await?;
+                    } else if shutdown_prepare_active {
+                        self.handle_prepare_for_shutdown(false).await?;
+                        self.wait_for_inhibitor_release(InhibitorKind::Shutdown).await?;
+                        self.acquire_inhibitor(InhibitorKind::Shutdown, "Publish status before shutdown")
+                            .await?;
+                        shutdown_prepare_active = false;
+                    } else {
+                        info!("System shutdown preparation was cancelled without an active shutdown hold");
+                    }
                 }
             };
         }
     }
 
-    async fn handle_prepare_for_sleep(&self, suspending: bool) {
+    async fn handle_prepare_for_sleep(
+        &self,
+        suspending: bool,
+    ) -> Result<(), crate::error::DbusError> {
         emit_prepare_for_sleep_event(
             &self.power_tx,
             self.delay_hold(InhibitorKind::Sleep),
@@ -205,23 +213,25 @@ impl PowerMonitor {
         .await;
 
         if !suspending {
-            // Re-acquire inhibitor after resume.
-            if let Err(e) = self
-                .acquire_inhibitor(InhibitorKind::Sleep, "Publish status before sleep")
-                .await
-            {
-                warn!("Failed to re-acquire sleep inhibitor after resume: {e}");
-            }
+            self.acquire_inhibitor(InhibitorKind::Sleep, "Publish status before sleep")
+                .await?;
         }
+
+        Ok(())
     }
 
-    async fn handle_prepare_for_shutdown(&self, shutting_down: bool) {
+    async fn handle_prepare_for_shutdown(
+        &self,
+        shutting_down: bool,
+    ) -> Result<(), crate::error::DbusError> {
         emit_prepare_for_shutdown_event(
             &self.power_tx,
             self.delay_hold(InhibitorKind::Shutdown),
             shutting_down,
         )
         .await;
+
+        Ok(())
     }
 
     /// Acquire a delay-mode inhibitor from logind.
@@ -244,12 +254,9 @@ impl PowerMonitor {
             .call("Inhibit", &(kind.as_str(), "hars-imp", reason, "delay"))
             .await?;
 
-        // Store the FD so it stays alive until we explicitly release it.
-        if let Ok(mut guard) = self.inhibitor_slot(kind).lock() {
-            *guard = Some(fd);
-        }
+        store_inhibitor_fd(self.inhibitor_slot(kind), kind.as_str(), fd)?;
 
-        info!("Acquired {} inhibitor (delay mode)", kind.label());
+        info!("Acquired {} inhibitor (delay mode)", kind.as_str());
         Ok(())
     }
 
@@ -262,8 +269,43 @@ impl PowerMonitor {
 
     /// Build a handle that can release the currently held inhibitor.
     fn delay_hold(&self, kind: InhibitorKind) -> LogindDelayHold {
-        LogindDelayHold::new(Arc::clone(self.inhibitor_slot(kind)), kind.label())
+        LogindDelayHold::new(Arc::clone(self.inhibitor_slot(kind)), kind.as_str())
     }
+
+    async fn wait_for_inhibitor_release(
+        &self,
+        kind: InhibitorKind,
+    ) -> Result<(), crate::error::DbusError> {
+        loop {
+            let released = {
+                let guard = self.inhibitor_slot(kind).lock().map_err(|_| {
+                    crate::error::DbusError::InhibitorState(format!(
+                        "{} inhibitor state lock is poisoned",
+                        kind.as_str()
+                    ))
+                })?;
+                guard.is_none()
+            };
+
+            if released {
+                return Ok(());
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+fn store_inhibitor_fd(
+    slot: &Arc<Mutex<Option<OwnedFd>>>,
+    label: &str,
+    fd: OwnedFd,
+) -> Result<(), crate::error::DbusError> {
+    let mut guard = slot.lock().map_err(|_| {
+        crate::error::DbusError::InhibitorState(format!("{label} inhibitor state lock is poisoned"))
+    })?;
+    *guard = Some(fd);
+    Ok(())
 }
 
 async fn emit_prepare_for_sleep_event(
@@ -290,13 +332,14 @@ async fn emit_prepare_for_shutdown_event(
         send_power_event(power_tx, PowerEvent::ShuttingDown(hold)).await;
     } else {
         info!("System shutdown preparation was cancelled");
+        let _ = power_tx.send(PowerEvent::ShutdownCancelled).await;
     }
 }
 
 async fn send_power_event(power_tx: &mpsc::Sender<PowerEvent>, event: PowerEvent) {
     let release_on_failure = match &event {
         PowerEvent::Suspending(hold) | PowerEvent::ShuttingDown(hold) => Some(hold.clone()),
-        PowerEvent::Resuming => None,
+        PowerEvent::Resuming | PowerEvent::ShutdownCancelled => None,
     };
 
     if power_tx.send(event).await.is_err() {
@@ -323,7 +366,7 @@ impl PowerMonitorSupervisor {
         let shutdown_inhibitor_fd = Arc::new(Mutex::new(None));
         let shutdown_hold = LogindDelayHold::new(
             Arc::clone(&shutdown_inhibitor_fd),
-            InhibitorKind::Shutdown.label(),
+            InhibitorKind::Shutdown.as_str(),
         );
         let handle = tokio::spawn(supervise_power_monitor(
             power_tx,
@@ -448,6 +491,12 @@ mod tests {
         LogindDelayHold::empty_for_test(label)
     }
 
+    fn test_fd() -> OwnedFd {
+        let file = File::open("/dev/null").expect("open /dev/null");
+        let fd: StdOwnedFd = file.into();
+        OwnedFd::from(fd)
+    }
+
     #[test]
     fn delay_hold_release_is_idempotent() {
         let slot = held_test_slot();
@@ -462,6 +511,35 @@ mod tests {
         assert!(slot.lock().expect("lock slot").is_none());
     }
 
+    #[test]
+    fn delay_hold_release_handles_poisoned_lock() {
+        let slot: Arc<Mutex<Option<OwnedFd>>> = Arc::new(Mutex::new(None));
+        let slot_for_thread = Arc::clone(&slot);
+        let _ = std::thread::spawn(move || {
+            let _guard = slot_for_thread.lock().expect("lock slot");
+            panic!("poison slot");
+        })
+        .join();
+        let hold = LogindDelayHold::new(slot, "shutdown");
+
+        hold.release();
+    }
+
+    #[test]
+    fn store_inhibitor_fd_errors_when_lock_is_poisoned() {
+        let slot: Arc<Mutex<Option<OwnedFd>>> = Arc::new(Mutex::new(None));
+        let slot_for_thread = Arc::clone(&slot);
+        let _ = std::thread::spawn(move || {
+            let _guard = slot_for_thread.lock().expect("lock slot");
+            panic!("poison slot");
+        })
+        .join();
+
+        let err = store_inhibitor_fd(&slot, "shutdown", test_fd()).expect_err("poisoned lock");
+
+        assert!(err.to_string().contains("shutdown inhibitor state lock"));
+    }
+
     #[tokio::test]
     async fn prepare_for_shutdown_true_emits_shutdown_event() {
         let (tx, mut rx) = mpsc::channel(1);
@@ -474,13 +552,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_shutdown_false_does_not_emit_event() {
+    async fn prepare_for_shutdown_false_emits_cancellation_event() {
         let (tx, mut rx) = mpsc::channel(1);
         let hold = empty_test_hold("shutdown");
 
         emit_prepare_for_shutdown_event(&tx, hold, false).await;
 
-        assert!(rx.try_recv().is_err());
+        let event = rx
+            .recv()
+            .await
+            .expect("shutdown cancellation should be sent");
+        assert!(matches!(event, PowerEvent::ShutdownCancelled));
     }
 
     #[tokio::test]

@@ -54,6 +54,9 @@ pub enum DbusError {
 
     #[error("D-Bus connection failed after retries")]
     ConnectionFailed,
+
+    #[error("D-Bus inhibitor state error: {0}")]
+    InhibitorState(String),
 }
 
 /// Errors related to component operations.

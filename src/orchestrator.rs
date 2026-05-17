@@ -35,9 +35,9 @@ struct MainLoopState<'a> {
     polling_handles: &'a mut Vec<JoinHandle<()>>,
 }
 
+#[derive(Debug)]
 enum MainLoopExit {
-    Signal,
-    LogindShutdown(LogindDelayHold),
+    Signal { shutdown_already_published: bool },
 }
 
 impl Orchestrator {
@@ -115,31 +115,16 @@ impl Orchestrator {
         polling_shutdown.cancel();
         sync_shutdown.cancel();
         await_task("reconnect sync worker", sync_handle).await;
-        let shutdown_hold = match exit {
-            MainLoopExit::Signal => process_shutdown_hold,
-            MainLoopExit::LogindShutdown(hold) => hold,
-        };
+        let MainLoopExit::Signal {
+            shutdown_already_published,
+        } = exit;
 
-        // Publish offline status.
-        if let Err(e) = publish_retained(
-            &mqtt_async_client,
-            &StatusComponent::state_topic_for(&self.config.hostname),
-            &StatusComponent::payload(StatusValue::Off),
-        )
-        .await
-        {
-            warn!("Failed to publish shutdown status sensor state: {e}");
+        if shutdown_already_published {
+            process_shutdown_hold.release();
+        } else {
+            publish_shutdown_state(&self.config, &mqtt_async_client, process_shutdown_hold).await;
         }
 
-        if let Err(e) =
-            publish_retained(&mqtt_async_client, &self.config.status_topic(), "offline").await
-        {
-            warn!("Failed to publish offline status: {e}");
-        }
-
-        // Give MQTT a moment to flush.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        shutdown_hold.release();
         power_supervisor.shutdown().await;
 
         info!("Shutdown complete");
@@ -232,6 +217,8 @@ impl Orchestrator {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("Failed to install SIGTERM handler");
 
+        let mut shutdown_already_published = false;
+
         loop {
             tokio::select! {
                 // --- MQTT events ---
@@ -296,7 +283,16 @@ impl Orchestrator {
                         }
                         PowerEvent::ShuttingDown(hold) => {
                             info!("Received logind shutdown preparation signal");
-                            return Ok(MainLoopExit::LogindShutdown(hold));
+                            publish_shutdown_state(&self.config, state.mqtt_client, hold).await;
+                            shutdown_already_published = true;
+                        }
+                        PowerEvent::ShutdownCancelled => {
+                            info!("Received logind shutdown cancellation signal");
+                            if let Err(e) = publish_online_state(&self.config, state.mqtt_client).await {
+                                warn!("Failed to publish shutdown cancellation status: {e}");
+                            }
+                            shutdown_already_published = false;
+                            request_reconnect_sync(state.sync_tx);
                         }
                     }
                 }
@@ -304,11 +300,15 @@ impl Orchestrator {
                 // --- Shutdown signals ---
                 _ = signal::ctrl_c() => {
                     info!("Received SIGINT, shutting down");
-                    return Ok(MainLoopExit::Signal);
+                    return Ok(MainLoopExit::Signal {
+                        shutdown_already_published,
+                    });
                 }
                 _ = sigterm.recv() => {
                     info!("Received SIGTERM, shutting down");
-                    return Ok(MainLoopExit::Signal);
+                    return Ok(MainLoopExit::Signal {
+                        shutdown_already_published,
+                    });
                 }
             }
         }
@@ -365,12 +365,21 @@ async fn reconnect_sync_once(
     let topics = registry.all_subscriptions();
     subscribe_topics(client, &topics).await.map_err(Box::new)?;
 
-    // Publish online status (retained).
+    publish_online_state(config, client).await?;
+
+    // Publish current state for all stateful components (e.g. switches).
+    registry.notify_resume(action_tx).await;
+    Ok(())
+}
+
+async fn publish_online_state(
+    config: &Config,
+    client: &rumqttc::AsyncClient,
+) -> Result<(), crate::error::AppError> {
     publish_retained(client, &config.status_topic(), "online")
         .await
         .map_err(Box::new)?;
 
-    // Publish user-visible status directly so lifecycle transitions stay ordered.
     publish_retained(
         client,
         &StatusComponent::state_topic_for(&config.hostname),
@@ -379,9 +388,30 @@ async fn reconnect_sync_once(
     .await
     .map_err(Box::new)?;
 
-    // Publish current state for all stateful components (e.g. switches).
-    registry.notify_resume(action_tx).await;
     Ok(())
+}
+
+async fn publish_shutdown_state(
+    config: &Config,
+    client: &rumqttc::AsyncClient,
+    hold: LogindDelayHold,
+) {
+    if let Err(e) = publish_retained(
+        client,
+        &StatusComponent::state_topic_for(&config.hostname),
+        &StatusComponent::payload(StatusValue::Off),
+    )
+    .await
+    {
+        warn!("Failed to publish shutdown status sensor state: {e}");
+    }
+
+    if let Err(e) = publish_retained(client, &config.status_topic(), "offline").await {
+        warn!("Failed to publish offline status: {e}");
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    hold.release();
 }
 
 async fn retry_reconnect_sync<F, Fut>(
@@ -494,18 +524,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn main_loop_exits_on_logind_shutdown_event() {
+    async fn main_loop_does_not_exit_on_logind_shutdown_event() {
         let config = test_config();
         let orchestrator = Orchestrator::new(config);
         let registry = ComponentRegistry::new();
-        let (event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(1);
+        let (_event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(1);
         let (power_tx, power_rx) = mpsc::channel::<PowerEvent>(1);
         let (action_tx, _action_rx) = mpsc::channel::<ActionMessage>(1);
         let (sync_tx, _sync_rx) = mpsc::channel::<()>(1);
         let mut polling_shutdown = CancellationToken::new();
         let mut polling_handles = Vec::new();
         let mqtt_options = rumqttc::MqttOptions::new("test-main-loop", "localhost", 1883);
-        let (mqtt_client, _eventloop) = rumqttc::AsyncClient::new(mqtt_options, 1);
+        let (mqtt_client, _eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
 
         power_tx
             .send(PowerEvent::ShuttingDown(LogindDelayHold::empty_for_test(
@@ -514,8 +544,9 @@ mod tests {
             .await
             .expect("queue shutdown event");
 
-        let exit = orchestrator
-            .main_loop(MainLoopState {
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            orchestrator.main_loop(MainLoopState {
                 event_rx: &mut event_rx,
                 power_rx,
                 mqtt_client: &mqtt_client,
@@ -524,12 +555,50 @@ mod tests {
                 sync_tx: &sync_tx,
                 polling_shutdown: &mut polling_shutdown,
                 polling_handles: &mut polling_handles,
-            })
-            .await
-            .expect("main loop should exit cleanly");
+            }),
+        )
+        .await;
 
-        assert!(matches!(exit, MainLoopExit::LogindShutdown(_)));
-        drop(event_tx);
+        assert!(
+            result.is_err(),
+            "main loop should stay running after shutdown prepare"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancelled_requests_reconnect_sync() {
+        let config = test_config();
+        let orchestrator = Orchestrator::new(config);
+        let registry = ComponentRegistry::new();
+        let (_event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(1);
+        let (power_tx, power_rx) = mpsc::channel::<PowerEvent>(1);
+        let (action_tx, _action_rx) = mpsc::channel::<ActionMessage>(1);
+        let (sync_tx, mut sync_rx) = mpsc::channel::<()>(1);
+        let mut polling_shutdown = CancellationToken::new();
+        let mut polling_handles = Vec::new();
+        let mqtt_options = rumqttc::MqttOptions::new("test-main-loop-cancel", "localhost", 1883);
+        let (mqtt_client, _eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
+
+        power_tx
+            .send(PowerEvent::ShutdownCancelled)
+            .await
+            .expect("queue shutdown cancellation event");
+
+        let main_loop = orchestrator.main_loop(MainLoopState {
+            event_rx: &mut event_rx,
+            power_rx,
+            mqtt_client: &mqtt_client,
+            registry: &registry,
+            action_tx: &action_tx,
+            sync_tx: &sync_tx,
+            polling_shutdown: &mut polling_shutdown,
+            polling_handles: &mut polling_handles,
+        });
+
+        tokio::select! {
+            result = main_loop => panic!("main loop should not exit on shutdown cancellation: {result:?}"),
+            sync = sync_rx.recv() => assert!(sync.is_some(), "shutdown cancellation should request reconnect sync"),
+        }
     }
 
     #[test]

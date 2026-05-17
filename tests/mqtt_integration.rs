@@ -358,7 +358,7 @@ async fn startup_publishes_availability_and_status_sensor() {
     let async_client = mqtt_client.client();
 
     let (event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(100);
-    let (action_tx, action_rx) = mpsc::channel(100);
+    let (_action_tx, action_rx) = mpsc::channel(100);
 
     tokio::spawn(mqtt_client.run(event_tx, action_rx));
     wait_for_connected(&mut event_rx).await;
@@ -388,7 +388,16 @@ async fn startup_publishes_availability_and_status_sensor() {
         .await
         .expect("publish availability");
 
-    status.on_resume(&action_tx).await;
+    let status_payload = StatusComponent::payload(StatusValue::On);
+    async_client
+        .publish(
+            StatusComponent::state_topic_for(&config.hostname),
+            QoS::AtLeastOnce,
+            true,
+            status_payload.as_bytes(),
+        )
+        .await
+        .expect("publish status sensor");
 
     let (_, discovery_received) = wait_for_publish(
         &mut sub_eventloop,

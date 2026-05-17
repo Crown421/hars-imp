@@ -1,12 +1,7 @@
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
-
-use crate::components::trait_def::{ActionMessage, OutboundMessage};
 
 /// Convert a name to a URL/topic-safe slug.
 pub fn slugify(name: &str) -> String {
@@ -130,51 +125,6 @@ fn signal_process_group(child_id: Option<u32>, signal: libc::c_int) {
             libc::kill(-(pid as libc::pid_t), signal);
         }
     }
-}
-
-/// Spawn a polling task that periodically invokes a callback and publishes
-/// the resulting payload to `state_topic`.
-///
-/// The callback receives a `&mut S` (arbitrary state, e.g. `sysinfo::System`)
-/// and returns the formatted payload string.
-///
-/// The task cancels cooperatively when `shutdown` is triggered.
-pub fn spawn_polling_task<S, F>(
-    sensor_name: &str,
-    state_topic: String,
-    interval: Duration,
-    mut state: S,
-    shutdown: CancellationToken,
-    action_tx: mpsc::Sender<ActionMessage>,
-    mut poll_fn: F,
-) -> JoinHandle<()>
-where
-    S: Send + 'static,
-    F: FnMut(&mut S) -> String + Send + 'static,
-{
-    let name = sensor_name.to_string();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    debug!("{name} polling task shutting down");
-                    return;
-                }
-                _ = tokio::time::sleep(interval) => {
-                    let payload = poll_fn(&mut state);
-                    debug!("{name}: {payload}");
-
-                    if let Err(e) = action_tx
-                        .send(OutboundMessage::state(state_topic.clone(), payload))
-                        .await
-                    {
-                        error!("Failed to send {name} update: {e}");
-                        return;
-                    }
-                }
-            }
-        }
-    })
 }
 
 #[cfg(test)]
