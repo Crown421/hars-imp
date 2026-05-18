@@ -41,6 +41,9 @@ pub enum MqttError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    #[error("MQTT internal error: {0}")]
+    Internal(String),
+
     #[error("TLS configuration error: {0}")]
     Tls(String),
 }

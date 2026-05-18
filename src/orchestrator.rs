@@ -15,9 +15,14 @@ use crate::components::system_monitor::SystemMonitorComponent;
 use crate::components::trait_def::{ActionMessage, Component};
 use crate::components::{button::ButtonComponent, switch::SwitchComponent};
 use crate::config::Config;
-use crate::dbus::power::{LogindDelayHold, PowerEvent, PowerMonitorSupervisor};
-use crate::mqtt::client::{publish_retained, subscribe_topics, MqttClient, MqttEvent};
+use crate::dbus::power::{PowerEvent, PowerMonitorSupervisor};
+use crate::mqtt::client::{
+    subscribe_topics, MqttClient, MqttControlHandle, MqttEvent, TrackedPublishResult,
+};
 use crate::mqtt::discovery::DeviceDiscoveryBuilder;
+
+const CRITICAL_PUBLISH_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+const RECONNECT_SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The central coordinator that owns all components and runs the main event loop.
 pub struct Orchestrator {
@@ -27,12 +32,35 @@ pub struct Orchestrator {
 struct MainLoopState<'a> {
     event_rx: &'a mut mpsc::Receiver<MqttEvent>,
     power_rx: mpsc::Receiver<PowerEvent>,
-    mqtt_client: &'a rumqttc::AsyncClient,
+    mqtt_control: &'a MqttControlHandle,
     registry: &'a ComponentRegistry,
     action_tx: &'a mpsc::Sender<ActionMessage>,
     sync_tx: &'a mpsc::Sender<()>,
     polling_shutdown: &'a mut CancellationToken,
     polling_handles: &'a mut Vec<JoinHandle<()>>,
+}
+
+struct ReconnectSyncWorkerContext {
+    config: Config,
+    registry: Arc<ComponentRegistry>,
+    client: rumqttc::AsyncClient,
+    mqtt_control: MqttControlHandle,
+    discovery_json: String,
+    action_tx: mpsc::Sender<ActionMessage>,
+}
+
+struct PowerTopicPublish {
+    topic: String,
+    payload: String,
+    timeout: Duration,
+    error_description: &'static str,
+    disconnect_log: &'static str,
+    timeout_log: &'static str,
+}
+
+struct PowerTopicPublishFailure {
+    publish: PowerTopicPublish,
+    result: TrackedPublishResult,
 }
 
 #[derive(Debug)]
@@ -66,6 +94,7 @@ impl Orchestrator {
         // --- Create MQTT client ---
         let mqtt_client = MqttClient::new(&self.config)?;
         let mqtt_async_client = mqtt_client.client();
+        let mqtt_control = mqtt_client.control_handle();
 
         // --- Set up supervised D-Bus power monitoring ---
         let mut power_supervisor = PowerMonitorSupervisor::spawn();
@@ -81,11 +110,14 @@ impl Orchestrator {
         // --- Spawn reconnect synchronization worker ---
         let sync_shutdown = CancellationToken::new();
         let sync_handle = Self::spawn_reconnect_sync_worker(
-            self.config.clone(),
-            Arc::clone(&registry),
-            mqtt_async_client.clone(),
-            discovery_json.clone(),
-            action_tx.clone(),
+            ReconnectSyncWorkerContext {
+                config: self.config.clone(),
+                registry: Arc::clone(&registry),
+                client: mqtt_async_client.clone(),
+                mqtt_control: mqtt_control.clone(),
+                discovery_json: discovery_json.clone(),
+                action_tx: action_tx.clone(),
+            },
             sync_rx,
             sync_shutdown.clone(),
         );
@@ -101,7 +133,7 @@ impl Orchestrator {
             .main_loop(MainLoopState {
                 event_rx: &mut event_rx,
                 power_rx,
-                mqtt_client: &mqtt_async_client,
+                mqtt_control: &mqtt_control,
                 registry: &registry,
                 action_tx: &action_tx,
                 sync_tx: &sync_tx,
@@ -122,7 +154,8 @@ impl Orchestrator {
         if shutdown_already_published {
             process_shutdown_hold.release();
         } else {
-            publish_shutdown_state(&self.config, &mqtt_async_client, process_shutdown_hold).await;
+            let _ = publish_shutdown_state(&self.config, &mqtt_control).await;
+            process_shutdown_hold.release();
         }
 
         power_supervisor.shutdown().await;
@@ -245,24 +278,15 @@ impl Orchestrator {
                             // Cancel polling tasks.
                             state.polling_shutdown.cancel();
 
-                            if let Err(e) = publish_retained(
-                                state.mqtt_client,
-                                &StatusComponent::state_topic_for(&self.config.hostname),
-                                &StatusComponent::payload(StatusValue::Suspended),
-                            )
-                            .await
-                            {
-                                warn!("Failed to publish suspended status sensor state: {e}");
+                            match publish_suspend_state(&self.config, state.mqtt_control).await {
+                                TrackedPublishResult::Acked => {}
+                                TrackedPublishResult::Disconnected => {
+                                    warn!("Suspend state publish interrupted by MQTT disconnect");
+                                }
+                                TrackedPublishResult::TimedOut => {
+                                    warn!("Timed out waiting for suspend state publish acknowledgment");
+                                }
                             }
-
-                            if let Err(e) =
-                                publish_retained(state.mqtt_client, &self.config.status_topic(), "offline").await
-                            {
-                                warn!("Failed to publish suspend availability status: {e}");
-                            }
-
-                            // Give MQTT time to flush.
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             hold.release();
                         }
                         PowerEvent::Resuming => {
@@ -283,13 +307,23 @@ impl Orchestrator {
                         }
                         PowerEvent::ShuttingDown(hold) => {
                             info!("Received logind shutdown preparation signal");
-                            publish_shutdown_state(&self.config, state.mqtt_client, hold).await;
+                            let _ = publish_shutdown_state(&self.config, state.mqtt_control).await;
+                            hold.release();
                             shutdown_already_published = true;
                         }
                         PowerEvent::ShutdownCancelled => {
                             info!("Received logind shutdown cancellation signal");
-                            if let Err(e) = publish_online_state(&self.config, state.mqtt_client).await {
-                                warn!("Failed to publish shutdown cancellation status: {e}");
+                            match publish_online_state(
+                                &self.config,
+                                state.mqtt_control,
+                                CRITICAL_PUBLISH_ACK_TIMEOUT,
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    warn!("Failed to publish shutdown cancellation status: {e}");
+                                }
                             }
                             shutdown_already_published = false;
                             request_reconnect_sync(state.sync_tx);
@@ -315,15 +349,20 @@ impl Orchestrator {
     }
 
     fn spawn_reconnect_sync_worker(
-        config: Config,
-        registry: Arc<ComponentRegistry>,
-        client: rumqttc::AsyncClient,
-        discovery_json: String,
-        action_tx: mpsc::Sender<ActionMessage>,
+        context: ReconnectSyncWorkerContext,
         mut sync_rx: mpsc::Receiver<()>,
         shutdown: CancellationToken,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
+            let ReconnectSyncWorkerContext {
+                config,
+                registry,
+                client,
+                mqtt_control,
+                discovery_json,
+                action_tx,
+            } = context;
+
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => {
@@ -337,6 +376,7 @@ impl Orchestrator {
                                 &config,
                                 registry.as_ref(),
                                 &client,
+                                &mqtt_control,
                                 &discovery_json,
                                 &action_tx,
                             )
@@ -353,19 +393,24 @@ async fn reconnect_sync_once(
     config: &Config,
     registry: &ComponentRegistry,
     client: &rumqttc::AsyncClient,
+    mqtt_control: &MqttControlHandle,
     discovery_json: &str,
     action_tx: &mpsc::Sender<ActionMessage>,
 ) -> Result<(), crate::error::AppError> {
-    // Publish discovery (retained).
-    publish_retained(client, &config.discovery_topic(), discovery_json)
-        .await
-        .map_err(Box::new)?;
+    require_tracked_publish(
+        mqtt_control,
+        &config.discovery_topic(),
+        discovery_json,
+        RECONNECT_SYNC_ACK_TIMEOUT,
+        "discovery payload",
+    )
+    .await?;
 
     // Subscribe to all component topics.
     let topics = registry.all_subscriptions();
     subscribe_topics(client, &topics).await.map_err(Box::new)?;
 
-    publish_online_state(config, client).await?;
+    publish_online_state(config, mqtt_control, RECONNECT_SYNC_ACK_TIMEOUT).await?;
 
     // Publish current state for all stateful components (e.g. switches).
     registry.notify_resume(action_tx).await;
@@ -374,44 +419,168 @@ async fn reconnect_sync_once(
 
 async fn publish_online_state(
     config: &Config,
-    client: &rumqttc::AsyncClient,
+    mqtt_control: &MqttControlHandle,
+    timeout: Duration,
 ) -> Result<(), crate::error::AppError> {
-    publish_retained(client, &config.status_topic(), "online")
-        .await
-        .map_err(Box::new)?;
-
-    publish_retained(
-        client,
-        &StatusComponent::state_topic_for(&config.hostname),
-        &StatusComponent::payload(StatusValue::On),
+    publish_power_topics(
+        mqtt_control,
+        [
+            PowerTopicPublish {
+                topic: config.status_topic(),
+                payload: "online".to_string(),
+                timeout,
+                error_description: "availability status",
+                disconnect_log: "",
+                timeout_log: "",
+            },
+            PowerTopicPublish {
+                topic: StatusComponent::state_topic_for(&config.hostname),
+                payload: StatusComponent::payload(StatusValue::On),
+                timeout,
+                error_description: "status sensor state",
+                disconnect_log: "",
+                timeout_log: "",
+            },
+        ],
     )
     .await
-    .map_err(Box::new)?;
+    .map_err(power_topic_publish_error)?;
 
     Ok(())
 }
 
-async fn publish_shutdown_state(
+async fn publish_suspend_state(
     config: &Config,
-    client: &rumqttc::AsyncClient,
-    hold: LogindDelayHold,
-) {
-    if let Err(e) = publish_retained(
-        client,
-        &StatusComponent::state_topic_for(&config.hostname),
-        &StatusComponent::payload(StatusValue::Off),
+    mqtt_control: &MqttControlHandle,
+) -> TrackedPublishResult {
+    match publish_power_topics(
+        mqtt_control,
+        [
+            PowerTopicPublish {
+                topic: StatusComponent::state_topic_for(&config.hostname),
+                payload: StatusComponent::payload(StatusValue::Suspended),
+                timeout: CRITICAL_PUBLISH_ACK_TIMEOUT,
+                error_description: "suspend status sensor state",
+                disconnect_log: "",
+                timeout_log: "",
+            },
+            PowerTopicPublish {
+                topic: config.status_topic(),
+                payload: "offline".to_string(),
+                timeout: CRITICAL_PUBLISH_ACK_TIMEOUT,
+                error_description: "suspend availability status",
+                disconnect_log: "",
+                timeout_log: "",
+            },
+        ],
     )
     .await
     {
-        warn!("Failed to publish shutdown status sensor state: {e}");
+        Ok(()) => TrackedPublishResult::Acked,
+        Err(failure) => failure.result,
+    }
+}
+
+async fn publish_shutdown_state(
+    config: &Config,
+    mqtt_control: &MqttControlHandle,
+) -> TrackedPublishResult {
+    match publish_power_topics(
+        mqtt_control,
+        [
+            PowerTopicPublish {
+                topic: StatusComponent::state_topic_for(&config.hostname),
+                payload: StatusComponent::payload(StatusValue::Off),
+                timeout: CRITICAL_PUBLISH_ACK_TIMEOUT,
+                error_description: "shutdown status sensor state",
+                disconnect_log: "Shutdown status publish interrupted by MQTT disconnect",
+                timeout_log: "Timed out waiting for shutdown status sensor acknowledgment",
+            },
+            PowerTopicPublish {
+                topic: config.status_topic(),
+                payload: "offline".to_string(),
+                timeout: CRITICAL_PUBLISH_ACK_TIMEOUT,
+                error_description: "shutdown availability status",
+                disconnect_log: "Shutdown availability publish interrupted by MQTT disconnect",
+                timeout_log: "Timed out waiting for shutdown availability acknowledgment",
+            },
+        ],
+    )
+    .await
+    {
+        Ok(()) => TrackedPublishResult::Acked,
+        Err(failure) => {
+            match failure.result {
+                TrackedPublishResult::Acked => {}
+                TrackedPublishResult::Disconnected => warn!("{}", failure.publish.disconnect_log),
+                TrackedPublishResult::TimedOut => warn!("{}", failure.publish.timeout_log),
+            }
+            failure.result
+        }
+    }
+}
+
+async fn publish_power_topics<I>(
+    mqtt_control: &MqttControlHandle,
+    publishes: I,
+) -> Result<(), PowerTopicPublishFailure>
+where
+    I: IntoIterator<Item = PowerTopicPublish>,
+{
+    for publish in publishes {
+        match mqtt_control
+            .publish_retained_tracked(
+                publish.topic.clone(),
+                publish.payload.clone(),
+                publish.timeout,
+            )
+            .await
+        {
+            TrackedPublishResult::Acked => {}
+            result => return Err(PowerTopicPublishFailure { publish, result }),
+        }
     }
 
-    if let Err(e) = publish_retained(client, &config.status_topic(), "offline").await {
-        warn!("Failed to publish offline status: {e}");
-    }
+    Ok(())
+}
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    hold.release();
+async fn require_tracked_publish(
+    mqtt_control: &MqttControlHandle,
+    topic: &str,
+    payload: &str,
+    timeout: Duration,
+    description: &str,
+) -> Result<(), crate::error::AppError> {
+    match mqtt_control
+        .publish_retained_tracked(topic.to_string(), payload.to_string(), timeout)
+        .await
+    {
+        TrackedPublishResult::Acked => Ok(()),
+        TrackedPublishResult::TimedOut => Err(Box::new(crate::error::MqttError::Internal(
+            format!("Timed out waiting for broker acknowledgment for {description}"),
+        ))
+        .into()),
+        TrackedPublishResult::Disconnected => Err(Box::new(crate::error::MqttError::Internal(
+            format!("MQTT disconnected before broker acknowledgment for {description}"),
+        ))
+        .into()),
+    }
+}
+
+fn power_topic_publish_error(failure: PowerTopicPublishFailure) -> crate::error::AppError {
+    match failure.result {
+        TrackedPublishResult::Acked => unreachable!("acked publishes do not fail"),
+        TrackedPublishResult::TimedOut => Box::new(crate::error::MqttError::Internal(format!(
+            "Timed out waiting for broker acknowledgment for {}",
+            failure.publish.error_description
+        )))
+        .into(),
+        TrackedPublishResult::Disconnected => Box::new(crate::error::MqttError::Internal(format!(
+            "MQTT disconnected before broker acknowledgment for {}",
+            failure.publish.error_description
+        )))
+        .into(),
+    }
 }
 
 async fn retry_reconnect_sync<F, Fut>(
@@ -534,13 +703,14 @@ mod tests {
         let (sync_tx, _sync_rx) = mpsc::channel::<()>(1);
         let mut polling_shutdown = CancellationToken::new();
         let mut polling_handles = Vec::new();
-        let mqtt_options = rumqttc::MqttOptions::new("test-main-loop", "localhost", 1883);
-        let (mqtt_client, _eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
+        let mqtt_client = MqttClient::new(&test_config()).expect("create mqtt client");
+        let mqtt_control = mqtt_client.control_handle();
+        drop(mqtt_client);
 
         power_tx
-            .send(PowerEvent::ShuttingDown(LogindDelayHold::empty_for_test(
-                "shutdown",
-            )))
+            .send(PowerEvent::ShuttingDown(
+                crate::dbus::power::LogindDelayHold::empty_for_test("shutdown"),
+            ))
             .await
             .expect("queue shutdown event");
 
@@ -549,7 +719,7 @@ mod tests {
             orchestrator.main_loop(MainLoopState {
                 event_rx: &mut event_rx,
                 power_rx,
-                mqtt_client: &mqtt_client,
+                mqtt_control: &mqtt_control,
                 registry: &registry,
                 action_tx: &action_tx,
                 sync_tx: &sync_tx,
@@ -576,8 +746,9 @@ mod tests {
         let (sync_tx, mut sync_rx) = mpsc::channel::<()>(1);
         let mut polling_shutdown = CancellationToken::new();
         let mut polling_handles = Vec::new();
-        let mqtt_options = rumqttc::MqttOptions::new("test-main-loop-cancel", "localhost", 1883);
-        let (mqtt_client, _eventloop) = rumqttc::AsyncClient::new(mqtt_options, 10);
+        let mqtt_client = MqttClient::new(&test_config()).expect("create mqtt client");
+        let mqtt_control = mqtt_client.control_handle();
+        drop(mqtt_client);
 
         power_tx
             .send(PowerEvent::ShutdownCancelled)
@@ -587,7 +758,7 @@ mod tests {
         let main_loop = orchestrator.main_loop(MainLoopState {
             event_rx: &mut event_rx,
             power_rx,
-            mqtt_client: &mqtt_client,
+            mqtt_control: &mqtt_control,
             registry: &registry,
             action_tx: &action_tx,
             sync_tx: &sync_tx,

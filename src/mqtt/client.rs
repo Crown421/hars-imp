@@ -1,7 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Cursor};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use rumqttc::tokio_rustls::rustls::{
@@ -9,9 +12,9 @@ use rumqttc::tokio_rustls::rustls::{
     ClientConfig, RootCertStore,
 };
 use rumqttc::{
-    AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, TlsConfiguration, Transport,
+    AsyncClient, Event, EventLoop, MqttOptions, Outgoing, Packet, QoS, TlsConfiguration, Transport,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Sleep;
 use tracing::{debug, error, info, warn};
 
@@ -25,6 +28,9 @@ const COMMAND_RESULT_BUFFER_CAP: usize = 256;
 pub struct MqttClient {
     client: AsyncClient,
     eventloop: EventLoop,
+    control_tx: mpsc::Sender<MqttControlRequest>,
+    control_rx: mpsc::Receiver<MqttControlRequest>,
+    next_control_request_id: Arc<AtomicU64>,
 }
 
 /// Events emitted by the MQTT client loop to the orchestrator.
@@ -37,6 +43,56 @@ pub enum MqttEvent {
 
     /// A connection error occurred; the client will retry.
     Disconnected(String),
+}
+
+#[derive(Clone)]
+pub struct MqttControlHandle {
+    tx: mpsc::Sender<MqttControlRequest>,
+    next_request_id: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedPublishResult {
+    Acked,
+    TimedOut,
+    Disconnected,
+}
+
+#[derive(Debug)]
+enum MqttControlRequest {
+    TrackedRetainedPublish {
+        request_id: u64,
+        topic: String,
+        payload: String,
+        result_tx: oneshot::Sender<TrackedPublishResult>,
+    },
+    CancelTrackedPublish {
+        request_id: u64,
+    },
+}
+
+struct TrackedPublishRequest {
+    request_id: u64,
+    topic: String,
+    payload: String,
+    result_tx: oneshot::Sender<TrackedPublishResult>,
+}
+
+struct InFlightTrackedPublish {
+    request_id: u64,
+    result_tx: oneshot::Sender<TrackedPublishResult>,
+}
+
+enum AwaitingPublish {
+    Tracked(TrackedPublishRequest),
+    Untracked,
+}
+
+#[derive(Default)]
+struct TrackedPublishState {
+    tracked_queue: VecDeque<TrackedPublishRequest>,
+    awaiting_publish: VecDeque<AwaitingPublish>,
+    in_flight_tracked: HashMap<u16, InFlightTrackedPublish>,
 }
 
 impl MqttClient {
@@ -65,13 +121,28 @@ impl MqttClient {
         ));
 
         let (client, eventloop) = AsyncClient::new(opts, 50);
+        let (control_tx, control_rx) = mpsc::channel(32);
+        let next_control_request_id = Arc::new(AtomicU64::new(1));
 
-        Ok(Self { client, eventloop })
+        Ok(Self {
+            client,
+            eventloop,
+            control_tx,
+            control_rx,
+            next_control_request_id,
+        })
     }
 
     /// Get a clone of the underlying async client for publishing.
     pub fn client(&self) -> AsyncClient {
         self.client.clone()
+    }
+
+    pub fn control_handle(&self) -> MqttControlHandle {
+        MqttControlHandle {
+            tx: self.control_tx.clone(),
+            next_request_id: Arc::clone(&self.next_control_request_id),
+        }
     }
 
     /// Run the MQTT event loop.
@@ -93,6 +164,8 @@ impl MqttClient {
         let mut connected = false;
         let mut outbound_paused = false;
         let client = self.client.clone();
+        let mut control_rx = self.control_rx;
+        let mut tracked_state = TrackedPublishState::new();
 
         loop {
             tokio::select! {
@@ -105,12 +178,13 @@ impl MqttClient {
                             if is_connack(&event) {
                                 connected = true;
                             }
-                            handle_event(event, &event_tx).await;
+                            handle_event(event, &event_tx, &mut tracked_state).await;
                         }
                         Err(e) => {
                             connected = false;
                             let msg = format!("{e}");
                             error!("MQTT poll error: {msg}");
+                            tracked_state.resolve_all_as_disconnected();
                             let _ = event_tx.send(MqttEvent::Disconnected(msg)).await;
 
                             reconnect_delay = Some(Box::pin(tokio::time::sleep(backoff)));
@@ -129,18 +203,210 @@ impl MqttClient {
                     drain_available_actions(&mut action_rx, &mut publish_buffer);
                 }
 
-                _ = tokio::task::yield_now(), if connected && publish_buffer.has_pending() && !outbound_paused => {
-                    let message = publish_buffer
-                        .pop_next()
-                        .expect("buffer should contain a pending outbound message");
-                    if let Err(error) = try_publish_outbound(&client, message) {
-                        let (message, e) = *error;
-                        warn!("Failed to enqueue publish to {}: {e}", message.topic());
-                        publish_buffer.push_front(message);
-                        outbound_paused = true;
+                Some(request) = control_rx.recv() => {
+                    tracked_state.handle_control_request(request);
+                }
+
+                _ = tokio::task::yield_now(), if connected && tracked_state.has_pending_outbound(&publish_buffer) && !outbound_paused => {
+                    if let Some(outbound) = tracked_state.next_outbound_publish(&mut publish_buffer) {
+                        if let Err(error) = try_publish_outbound(&client, &outbound.message) {
+                            let (message, e) = *error;
+                            match outbound.kind {
+                                OutboundKind::Tracked(request) => {
+                                    warn!("Failed to enqueue tracked publish to {}: {e}", message.topic());
+                                    tracked_state.requeue_tracked_front(request);
+                                }
+                                OutboundKind::Untracked => {
+                                    warn!("Failed to enqueue publish to {}: {e}", message.topic());
+                                    publish_buffer.push_front(message);
+                                }
+                            }
+                            outbound_paused = true;
+                        } else {
+                            tracked_state.record_enqueued_outbound(outbound.kind);
+                        }
                     }
                 }
             }
+        }
+    }
+}
+
+impl MqttControlHandle {
+    pub async fn publish_retained_tracked(
+        &self,
+        topic: impl Into<String>,
+        payload: impl Into<String>,
+        timeout: Duration,
+    ) -> TrackedPublishResult {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (result_tx, result_rx) = oneshot::channel();
+        let request = MqttControlRequest::TrackedRetainedPublish {
+            request_id,
+            topic: topic.into(),
+            payload: payload.into(),
+            result_tx,
+        };
+
+        if self.tx.send(request).await.is_err() {
+            return TrackedPublishResult::Disconnected;
+        }
+
+        match tokio::time::timeout(timeout, result_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => TrackedPublishResult::Disconnected,
+            Err(_) => {
+                let _ = self
+                    .tx
+                    .send(MqttControlRequest::CancelTrackedPublish { request_id })
+                    .await;
+                TrackedPublishResult::TimedOut
+            }
+        }
+    }
+}
+
+impl TrackedPublishState {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn has_pending_outbound(&self, publish_buffer: &PublishBuffer) -> bool {
+        !self.tracked_queue.is_empty() || publish_buffer.has_pending()
+    }
+
+    fn next_outbound_publish(
+        &mut self,
+        publish_buffer: &mut PublishBuffer,
+    ) -> Option<OutboundSend> {
+        if let Some(request) = self.tracked_queue.pop_front() {
+            return Some(OutboundSend {
+                message: OutboundMessage::retained_state(&request.topic, &request.payload),
+                kind: OutboundKind::Tracked(request),
+            });
+        }
+
+        publish_buffer.pop_next().map(|message| OutboundSend {
+            message,
+            kind: OutboundKind::Untracked,
+        })
+    }
+
+    fn record_enqueued_outbound(&mut self, kind: OutboundKind) {
+        self.awaiting_publish.push_back(kind.into_awaiting());
+    }
+
+    fn requeue_tracked_front(&mut self, request: TrackedPublishRequest) {
+        self.tracked_queue.push_front(request);
+    }
+
+    fn handle_control_request(&mut self, request: MqttControlRequest) {
+        match request {
+            MqttControlRequest::TrackedRetainedPublish {
+                request_id,
+                topic,
+                payload,
+                result_tx,
+            } => {
+                self.queue_tracked_request(TrackedPublishRequest {
+                    request_id,
+                    topic,
+                    payload,
+                    result_tx,
+                });
+            }
+            MqttControlRequest::CancelTrackedPublish { request_id } => {
+                self.cancel_request(request_id);
+            }
+        }
+    }
+
+    fn queue_tracked_request(&mut self, request: TrackedPublishRequest) {
+        debug!(
+            "Queued tracked publish request {} for topic {}",
+            request.request_id, request.topic
+        );
+        self.tracked_queue.push_back(request);
+    }
+
+    fn record_outgoing_publish(&mut self, pkid: u16) {
+        match self.awaiting_publish.pop_front() {
+            Some(AwaitingPublish::Tracked(request)) => {
+                debug!(
+                    "Tracked publish request {} assigned pkid {}",
+                    request.request_id, pkid
+                );
+                self.in_flight_tracked.insert(
+                    pkid,
+                    InFlightTrackedPublish {
+                        request_id: request.request_id,
+                        result_tx: request.result_tx,
+                    },
+                );
+            }
+            Some(AwaitingPublish::Untracked) => {}
+            None => {
+                debug!("Observed outgoing publish pkid {pkid} without a local marker");
+            }
+        }
+    }
+
+    fn resolve_puback(&mut self, pkid: u16) {
+        if let Some(tracked) = self.in_flight_tracked.remove(&pkid) {
+            debug!(
+                "Tracked publish request {} acknowledged with pkid {}",
+                tracked.request_id, pkid
+            );
+            let _ = tracked.result_tx.send(TrackedPublishResult::Acked);
+        }
+    }
+
+    fn cancel_request(&mut self, request_id: u64) -> bool {
+        if let Some(index) = self
+            .tracked_queue
+            .iter()
+            .position(|request| request.request_id == request_id)
+        {
+            self.tracked_queue.remove(index);
+            return true;
+        }
+
+        if let Some(index) = self.awaiting_publish.iter().position(|publish| {
+            matches!(
+                publish,
+                AwaitingPublish::Tracked(request) if request.request_id == request_id
+            )
+        }) {
+            self.awaiting_publish.remove(index);
+            return true;
+        }
+
+        let pkid = self
+            .in_flight_tracked
+            .iter()
+            .find_map(|(pkid, tracked)| (tracked.request_id == request_id).then_some(*pkid));
+
+        if let Some(pkid) = pkid {
+            self.in_flight_tracked.remove(&pkid);
+            return true;
+        }
+
+        false
+    }
+
+    fn resolve_all_as_disconnected(&mut self) {
+        while let Some(request) = self.tracked_queue.pop_front() {
+            let _ = request.result_tx.send(TrackedPublishResult::Disconnected);
+        }
+
+        while let Some(publish) = self.awaiting_publish.pop_front() {
+            if let AwaitingPublish::Tracked(request) = publish {
+                let _ = request.result_tx.send(TrackedPublishResult::Disconnected);
+            }
+        }
+
+        for (_, tracked) in self.in_flight_tracked.drain() {
+            let _ = tracked.result_tx.send(TrackedPublishResult::Disconnected);
         }
     }
 }
@@ -312,7 +578,7 @@ fn drain_available_actions(
 
 fn try_publish_outbound(
     client: &AsyncClient,
-    message: OutboundMessage,
+    message: &OutboundMessage,
 ) -> Result<(), Box<(OutboundMessage, rumqttc::ClientError)>> {
     let topic = message.topic().to_string();
     let retain = message.retain();
@@ -320,7 +586,7 @@ fn try_publish_outbound(
 
     client
         .try_publish(&topic, QoS::AtLeastOnce, retain, payload)
-        .map_err(|e| Box::new((message, e)))
+        .map_err(|e| Box::new((message.clone(), e)))
 }
 
 async fn wait_for_reconnect_delay(delay: &mut Option<Pin<Box<Sleep>>>) {
@@ -333,11 +599,18 @@ fn is_connack(event: &Event) -> bool {
     matches!(event, Event::Incoming(Packet::ConnAck(_)))
 }
 
-async fn handle_event(event: Event, event_tx: &mpsc::Sender<MqttEvent>) {
+async fn handle_event(
+    event: Event,
+    event_tx: &mpsc::Sender<MqttEvent>,
+    tracked_state: &mut TrackedPublishState,
+) {
     match event {
         Event::Incoming(Packet::ConnAck(_)) => {
             info!("MQTT connected");
             let _ = event_tx.send(MqttEvent::Connected).await;
+        }
+        Event::Incoming(Packet::PubAck(puback)) => {
+            tracked_state.resolve_puback(puback.pkid);
         }
         Event::Incoming(Packet::Publish(publish)) => {
             let topic = publish.topic.clone();
@@ -348,8 +621,28 @@ async fn handle_event(event: Event, event_tx: &mpsc::Sender<MqttEvent>) {
         Event::Incoming(Packet::SubAck(_)) => {
             debug!("MQTT subscription acknowledged");
         }
+        Event::Outgoing(Outgoing::Publish(pkid)) => tracked_state.record_outgoing_publish(pkid),
         _ => {
-            // Ignore other events (PingResp, PubAck, etc.)
+            // Ignore other events.
+        }
+    }
+}
+
+struct OutboundSend {
+    message: OutboundMessage,
+    kind: OutboundKind,
+}
+
+enum OutboundKind {
+    Tracked(TrackedPublishRequest),
+    Untracked,
+}
+
+impl OutboundKind {
+    fn into_awaiting(self) -> AwaitingPublish {
+        match self {
+            Self::Tracked(request) => AwaitingPublish::Tracked(request),
+            Self::Untracked => AwaitingPublish::Untracked,
         }
     }
 }
@@ -455,6 +748,7 @@ pub async fn subscribe_topics(client: &AsyncClient, topics: &[String]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rumqttc::PubAck;
 
     #[test]
     fn publish_buffer_coalesces_state_by_topic() {
@@ -568,5 +862,169 @@ mod tests {
         assert_eq!(second.payload(), "three");
 
         assert!(buffer.pop_next().is_none());
+    }
+
+    #[tokio::test]
+    async fn tracked_publish_times_out_and_sends_cancel() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = MqttControlHandle {
+            tx,
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        };
+
+        let publish = tokio::spawn(async move {
+            handle
+                .publish_retained_tracked("tracked/topic", "payload", Duration::from_millis(10))
+                .await
+        });
+
+        let request = rx.recv().await.expect("tracked request should be queued");
+        match request {
+            MqttControlRequest::TrackedRetainedPublish {
+                request_id,
+                topic,
+                payload,
+                ..
+            } => {
+                assert_eq!(request_id, 1);
+                assert_eq!(topic, "tracked/topic");
+                assert_eq!(payload, "payload");
+            }
+            _ => panic!("expected tracked publish request"),
+        }
+
+        let result = publish.await.expect("publish task should complete");
+        assert_eq!(result, TrackedPublishResult::TimedOut);
+
+        match rx.recv().await.expect("cancel request should be sent") {
+            MqttControlRequest::CancelTrackedPublish { request_id } => {
+                assert_eq!(request_id, 1);
+            }
+            _ => panic!("expected cancellation request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tracked_publish_is_acked_from_puback() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (result_tx, result_rx) = oneshot::channel();
+        let mut tracked_state = TrackedPublishState {
+            awaiting_publish: VecDeque::from([AwaitingPublish::Tracked(TrackedPublishRequest {
+                request_id: 11,
+                topic: "tracked/topic".to_string(),
+                payload: "payload".to_string(),
+                result_tx,
+            })]),
+            ..TrackedPublishState::default()
+        };
+
+        handle_event(
+            Event::Outgoing(Outgoing::Publish(7)),
+            &event_tx,
+            &mut tracked_state,
+        )
+        .await;
+
+        assert!(event_rx.try_recv().is_err());
+        assert!(tracked_state.awaiting_publish.is_empty());
+        assert!(tracked_state.in_flight_tracked.contains_key(&7));
+
+        handle_event(
+            Event::Incoming(Packet::PubAck(PubAck::new(7))),
+            &event_tx,
+            &mut tracked_state,
+        )
+        .await;
+
+        assert_eq!(
+            result_rx.await.expect("tracked publish should resolve"),
+            TrackedPublishResult::Acked
+        );
+        assert!(tracked_state.in_flight_tracked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_resolves_all_tracked_publishes() {
+        let (queued_tx, queued_rx) = oneshot::channel();
+        let (awaiting_tx, awaiting_rx) = oneshot::channel();
+        let (inflight_tx, inflight_rx) = oneshot::channel();
+        let mut tracked_state = TrackedPublishState {
+            tracked_queue: VecDeque::from([TrackedPublishRequest {
+                request_id: 1,
+                topic: "queued/topic".to_string(),
+                payload: "queued".to_string(),
+                result_tx: queued_tx,
+            }]),
+            awaiting_publish: VecDeque::from([
+                AwaitingPublish::Untracked,
+                AwaitingPublish::Tracked(TrackedPublishRequest {
+                    request_id: 2,
+                    topic: "awaiting/topic".to_string(),
+                    payload: "awaiting".to_string(),
+                    result_tx: awaiting_tx,
+                }),
+            ]),
+            in_flight_tracked: HashMap::from([(
+                9,
+                InFlightTrackedPublish {
+                    request_id: 3,
+                    result_tx: inflight_tx,
+                },
+            )]),
+        };
+
+        tracked_state.resolve_all_as_disconnected();
+
+        assert_eq!(
+            queued_rx.await.expect("queued publish should resolve"),
+            TrackedPublishResult::Disconnected
+        );
+        assert_eq!(
+            awaiting_rx.await.expect("awaiting publish should resolve"),
+            TrackedPublishResult::Disconnected
+        );
+        assert_eq!(
+            inflight_rx.await.expect("in-flight publish should resolve"),
+            TrackedPublishResult::Disconnected
+        );
+        assert!(tracked_state.tracked_queue.is_empty());
+        assert!(tracked_state.awaiting_publish.is_empty());
+        assert!(tracked_state.in_flight_tracked.is_empty());
+    }
+
+    #[test]
+    fn tracked_publish_cancel_removes_request_from_all_states() {
+        let (queued_tx, _queued_rx) = oneshot::channel();
+        let (awaiting_tx, _awaiting_rx) = oneshot::channel();
+        let (inflight_tx, _inflight_rx) = oneshot::channel();
+        let mut tracked_state = TrackedPublishState {
+            tracked_queue: VecDeque::from([TrackedPublishRequest {
+                request_id: 1,
+                topic: "queued/topic".to_string(),
+                payload: "queued".to_string(),
+                result_tx: queued_tx,
+            }]),
+            awaiting_publish: VecDeque::from([AwaitingPublish::Tracked(TrackedPublishRequest {
+                request_id: 2,
+                topic: "awaiting/topic".to_string(),
+                payload: "awaiting".to_string(),
+                result_tx: awaiting_tx,
+            })]),
+            in_flight_tracked: HashMap::from([(
+                9,
+                InFlightTrackedPublish {
+                    request_id: 3,
+                    result_tx: inflight_tx,
+                },
+            )]),
+        };
+
+        assert!(tracked_state.cancel_request(1));
+        assert!(tracked_state.cancel_request(2));
+        assert!(tracked_state.cancel_request(3));
+        assert!(!tracked_state.cancel_request(99));
+        assert!(tracked_state.tracked_queue.is_empty());
+        assert!(tracked_state.awaiting_publish.is_empty());
+        assert!(tracked_state.in_flight_tracked.is_empty());
     }
 }
