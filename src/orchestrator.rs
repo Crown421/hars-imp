@@ -301,8 +301,9 @@ impl Orchestrator {
                                 state.polling_shutdown.clone(),
                             );
 
-                            // Treat resume like a reconnect/state synchronization event
-                            // even if the MQTT connection does not emit a fresh ConnAck.
+                            // Treat resume like the same reconnect/state synchronization
+                            // flow used after initial startup or MQTT reconnect, even if
+                            // the broker connection does not emit a fresh ConnAck.
                             request_reconnect_sync(state.sync_tx);
                         }
                         PowerEvent::ShuttingDown(hold) => {
@@ -412,8 +413,9 @@ async fn reconnect_sync_once(
 
     publish_online_state(config, mqtt_control, RECONNECT_SYNC_ACK_TIMEOUT).await?;
 
-    // Publish current state for all stateful components (e.g. switches).
-    registry.notify_resume(action_tx).await;
+    // Publish current state for all stateful components as part of the shared
+    // reconnect/startup and resume-driven synchronization flow.
+    registry.sync_states(action_tx).await;
     Ok(())
 }
 

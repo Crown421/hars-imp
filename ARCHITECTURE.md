@@ -87,8 +87,8 @@ pub trait Component: Send + Sync {
         None
     }
 
-    /// Called after resume from suspend. Re-publish current state.
-    async fn on_resume(&self, action_tx: &mpsc::Sender<ActionMessage>) {}
+    /// Called when the orchestrator requests a state synchronization pass.
+    async fn sync_state(&self, action_tx: &mpsc::Sender<ActionMessage>) {}
 }
 ```
 

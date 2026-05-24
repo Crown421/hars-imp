@@ -118,10 +118,10 @@ impl ComponentRegistry {
         }
     }
 
-    /// Call `on_resume` on all components.
-    pub async fn notify_resume(&self, action_tx: &mpsc::Sender<ActionMessage>) {
+    /// Run a registry-wide state synchronization pass across all components.
+    pub async fn sync_states(&self, action_tx: &mpsc::Sender<ActionMessage>) {
         for component in &self.components {
-            component.on_resume(action_tx).await;
+            component.sync_state(action_tx).await;
         }
     }
 }

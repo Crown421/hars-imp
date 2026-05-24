@@ -714,13 +714,13 @@ async fn switch_state_round_trip() {
     assert_eq!(state_msg, "OFF");
 }
 
-/// Test: on_resume re-publishes the real switch state from readback.
+/// Test: sync_state re-publishes the real switch state from readback.
 #[tokio::test]
-async fn on_resume_publishes_switch_readback_state() {
+async fn sync_state_publishes_switch_readback_state() {
     let broker = broker_or_skip!();
     let config = test_config(broker.port());
     let dir = tempfile::tempdir().unwrap();
-    let state_file = dir.path().join("resume-state.txt");
+    let state_file = dir.path().join("sync-state.txt");
     std::fs::write(&state_file, "OFF").unwrap();
     let action_script = dir.path().join("set-state.sh");
     let script = format!(
@@ -738,7 +738,7 @@ async fn on_resume_publishes_switch_readback_state() {
     std::fs::set_permissions(&action_script, permissions).unwrap();
 
     let sw_config = SwitchConfig {
-        name: "Resume Switch".to_string(),
+        name: "Sync Switch".to_string(),
         exec: Some(action_script.display().to_string()),
         dbus: None,
         status_exec: Some(format!("cat {}", state_file.display())),
@@ -748,7 +748,7 @@ async fn on_resume_publishes_switch_readback_state() {
     let state_topic = format!(
         "homeassistant/switch/{}/{}/state",
         config.hostname,
-        slugify("Resume Switch")
+        slugify("Sync Switch")
     );
 
     let mqtt_client = MqttClient::new(&config).expect("create MqttClient");
@@ -776,8 +776,8 @@ async fn on_resume_publishes_switch_readback_state() {
     // Change the underlying state out of band.
     std::fs::write(&state_file, "OFF").unwrap();
 
-    // Now simulate resume — should re-publish the readback OFF.
-    switch.on_resume(&action_tx).await;
+    // Now trigger a state sync — should re-publish the readback OFF.
+    switch.sync_state(&action_tx).await;
 
     let (_, state_msg) =
         wait_for_mqtt_message(&mut event_rx, Some(&state_topic), Duration::from_secs(3)).await;

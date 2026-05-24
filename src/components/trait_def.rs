@@ -99,7 +99,7 @@ pub type ActionMessage = OutboundMessage;
 /// - Declare which MQTT topics it needs
 /// - Handle inbound MQTT messages
 /// - Optionally run a polling loop (for sensors)
-/// - Re-publish state after a suspend/resume cycle
+/// - Synchronize current state when requested by the orchestrator
 #[async_trait]
 pub trait Component: Send + Sync {
     /// Human-readable name, used as the component key in discovery.
@@ -145,8 +145,9 @@ pub trait Component: Send + Sync {
         None
     }
 
-    /// Called after the system resumes from suspend.
+    /// Called when the orchestrator requests a component-wide state synchronization.
     ///
-    /// Components should re-publish their current state.
-    async fn on_resume(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
+    /// Components should publish or reconcile their current state so downstream
+    /// consumers observe the latest value after reconnect/startup or resume.
+    async fn sync_state(&self, _action_tx: &mpsc::Sender<ActionMessage>) {}
 }

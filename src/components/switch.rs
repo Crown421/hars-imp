@@ -110,6 +110,28 @@ impl SwitchComponent {
         self.publish_known_state(action_tx, state).await;
         Ok(state)
     }
+
+    async fn sync_and_publish_current_state(
+        &self,
+        action_tx: &mpsc::Sender<ActionMessage>,
+        publish_cached_on_readback_failure: bool,
+    ) -> Result<bool, ComponentError> {
+        if self.status_reader.is_none() {
+            let state = *self.state.lock().await;
+            self.publish_known_state(action_tx, state).await;
+            return Ok(state);
+        }
+
+        match self.refresh_state_from_readback(action_tx).await {
+            Ok(state) => Ok(state),
+            Err(err) => {
+                if publish_cached_on_readback_failure {
+                    self.publish_state(action_tx).await;
+                }
+                Err(err)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -178,36 +200,31 @@ impl Component for SwitchComponent {
         };
 
         if success {
-            if self.status_reader.is_some() {
-                match self.refresh_state_from_readback(action_tx).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!(
-                            "Switch '{}' status readback failed after command: {e}",
-                            self.name
-                        );
-                    }
-                }
-                return;
+            if self.status_reader.is_none() {
+                *self.state.lock().await = desired_state;
             }
 
-            *self.state.lock().await = desired_state;
+            if let Err(e) = self.sync_and_publish_current_state(action_tx, false).await {
+                if self.status_reader.is_some() {
+                    error!(
+                        "Switch '{}' status readback failed after command: {e}",
+                        self.name
+                    );
+                }
+            }
+        } else {
+            self.publish_state(action_tx).await;
         }
-        self.publish_state(action_tx).await;
     }
 
-    async fn on_resume(&self, action_tx: &mpsc::Sender<ActionMessage>) {
-        if self.status_reader.is_some() {
-            match self.refresh_state_from_readback(action_tx).await {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("Switch '{}' status readback failed: {e}", self.name);
-                }
-            }
-            return;
-        }
+    async fn sync_state(&self, action_tx: &mpsc::Sender<ActionMessage>) {
+        let _action_guard = self.action_lock.lock().await;
 
-        self.publish_state(action_tx).await;
+        if let Err(e) = self.sync_and_publish_current_state(action_tx, false).await {
+            if self.status_reader.is_some() {
+                error!("Switch '{}' status readback failed: {e}", self.name);
+            }
+        }
     }
 }
 
@@ -440,20 +457,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switch_on_resume_publishes_current_state() {
+    async fn switch_sync_state_publishes_current_state() {
         let sw = test_switch();
         let (tx, mut rx) = mpsc::channel(16);
 
         // Default state is OFF
-        sw.on_resume(&tx).await;
+        sw.sync_state(&tx).await;
 
-        let message = rx.try_recv().expect("should have published on resume");
+        let message = rx.try_recv().expect("should have published during sync");
         assert!(message.topic().contains("state"));
         assert_eq!(message.payload(), "OFF");
     }
 
     #[tokio::test]
-    async fn switch_on_resume_reads_back_on_state() {
+    async fn switch_sync_state_reads_back_on_state() {
         let config = SwitchConfig {
             name: "Readback On".to_string(),
             exec: Some("true".to_string()),
@@ -464,15 +481,15 @@ mod tests {
         let sw = SwitchComponent::new(&config, "myhost");
         let (tx, mut rx) = mpsc::channel(16);
 
-        sw.on_resume(&tx).await;
+        sw.sync_state(&tx).await;
 
-        let message = rx.try_recv().expect("should have published on resume");
+        let message = rx.try_recv().expect("should have published during sync");
         assert_eq!(message.payload(), "ON");
         assert!(*sw.state.lock().await);
     }
 
     #[tokio::test]
-    async fn switch_on_resume_reads_back_off_state() {
+    async fn switch_sync_state_reads_back_off_state() {
         let config = SwitchConfig {
             name: "Readback Off".to_string(),
             exec: Some("true".to_string()),
@@ -483,15 +500,15 @@ mod tests {
         let sw = SwitchComponent::new(&config, "myhost");
         let (tx, mut rx) = mpsc::channel(16);
 
-        sw.on_resume(&tx).await;
+        sw.sync_state(&tx).await;
 
-        let message = rx.try_recv().expect("should have published on resume");
+        let message = rx.try_recv().expect("should have published during sync");
         assert_eq!(message.payload(), "OFF");
         assert!(!*sw.state.lock().await);
     }
 
     #[tokio::test]
-    async fn switch_on_resume_skips_publish_when_readback_fails() {
+    async fn switch_sync_state_skips_publish_when_readback_fails() {
         let config = SwitchConfig {
             name: "Readback Fail".to_string(),
             exec: Some("true".to_string()),
@@ -502,7 +519,7 @@ mod tests {
         let sw = SwitchComponent::new(&config, "myhost");
         let (tx, mut rx) = mpsc::channel(16);
 
-        sw.on_resume(&tx).await;
+        sw.sync_state(&tx).await;
 
         assert!(
             rx.try_recv().is_err(),
@@ -537,6 +554,57 @@ mod tests {
         let message = rx.try_recv().expect("should have published state");
         assert_eq!(message.payload(), "ON");
         assert!(*sw.state.lock().await);
+    }
+
+    #[tokio::test]
+    async fn switch_sync_state_waits_for_in_flight_command_before_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join("state.txt");
+        fs::write(&state_file, "OFF").unwrap();
+
+        let (_script_dir, script_path) = write_test_script(&format!(
+            "#!/bin/sh\nsleep 0.2\nif [ \"$1\" = \"on\" ]; then\n  printf ON > \"{}\"\nelse\n  printf OFF > \"{}\"\nfi\n",
+            state_file.display(),
+            state_file.display()
+        ));
+        let switch = Arc::new(SwitchComponent::new(
+            &SwitchConfig {
+                name: "Concurrent Switch".to_string(),
+                exec: Some(script_path),
+                dbus: None,
+                status_exec: Some(format!("cat {}", state_file.display())),
+                status_dbus: None,
+            },
+            "myhost",
+        ));
+        let (tx, mut rx) = mpsc::channel(16);
+
+        let command_switch = Arc::clone(&switch);
+        let command_tx = tx.clone();
+        let command_task = tokio::spawn(async move {
+            command_switch
+                .handle_message("topic", "ON", &command_tx)
+                .await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let sync_switch = Arc::clone(&switch);
+        let sync_tx = tx.clone();
+        let sync_task = tokio::spawn(async move {
+            sync_switch.sync_state(&sync_tx).await;
+        });
+
+        command_task.await.unwrap();
+        sync_task.await.unwrap();
+
+        let first = rx.try_recv().expect("command should publish state");
+        let second = rx.try_recv().expect("sync should publish state");
+        assert_eq!(first.payload(), "ON");
+        assert_eq!(second.payload(), "ON");
+        assert!(rx.try_recv().is_err(), "should only publish twice");
+        assert_eq!(fs::read_to_string(&state_file).unwrap(), "ON");
+        assert!(*switch.state.lock().await);
     }
 
     #[tokio::test]
