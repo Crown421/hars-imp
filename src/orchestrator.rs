@@ -422,31 +422,34 @@ async fn publish_online_state(
     mqtt_control: &MqttControlHandle,
     timeout: Duration,
 ) -> Result<(), crate::error::AppError> {
-    publish_power_topics(
-        mqtt_control,
-        [
-            PowerTopicPublish {
-                topic: config.status_topic(),
-                payload: "online".to_string(),
-                timeout,
-                error_description: "availability status",
-                disconnect_log: "",
-                timeout_log: "",
-            },
-            PowerTopicPublish {
-                topic: StatusComponent::state_topic_for(&config.hostname),
-                payload: StatusComponent::payload(StatusValue::On),
-                timeout,
-                error_description: "status sensor state",
-                disconnect_log: "",
-                timeout_log: "",
-            },
-        ],
-    )
-    .await
-    .map_err(power_topic_publish_error)?;
+    publish_power_topics(mqtt_control, online_power_topic_publishes(config, timeout))
+        .await
+        .map_err(power_topic_publish_error)?;
 
     Ok(())
+}
+
+fn online_power_topic_publishes(config: &Config, timeout: Duration) -> [PowerTopicPublish; 2] {
+    [
+        // Overwrite the retained steady-state power value before making the
+        // entity available again, otherwise HA can briefly replay Suspended/Off.
+        PowerTopicPublish {
+            topic: StatusComponent::state_topic_for(&config.hostname),
+            payload: StatusComponent::payload(StatusValue::On),
+            timeout,
+            error_description: "status sensor state",
+            disconnect_log: "",
+            timeout_log: "",
+        },
+        PowerTopicPublish {
+            topic: config.status_topic(),
+            payload: "online".to_string(),
+            timeout,
+            error_description: "availability status",
+            disconnect_log: "",
+            timeout_log: "",
+        },
+    ]
 }
 
 async fn publish_suspend_state(
@@ -770,6 +773,23 @@ mod tests {
             result = main_loop => panic!("main loop should not exit on shutdown cancellation: {result:?}"),
             sync = sync_rx.recv() => assert!(sync.is_some(), "shutdown cancellation should request reconnect sync"),
         }
+    }
+
+    #[test]
+    fn online_power_topics_publish_status_before_availability() {
+        let config = test_config();
+        let publishes = online_power_topic_publishes(&config, Duration::from_secs(2));
+
+        assert_eq!(
+            publishes[0].topic,
+            StatusComponent::state_topic_for(&config.hostname)
+        );
+        assert_eq!(
+            publishes[0].payload,
+            StatusComponent::payload(StatusValue::On)
+        );
+        assert_eq!(publishes[1].topic, config.status_topic());
+        assert_eq!(publishes[1].payload, "online");
     }
 
     #[test]

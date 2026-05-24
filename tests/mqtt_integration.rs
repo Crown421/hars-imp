@@ -428,6 +428,82 @@ async fn startup_publishes_availability_and_status_sensor() {
     assert_eq!(status_payload, StatusComponent::payload(StatusValue::On));
 }
 
+/// Test: recovery overwrites retained power state before making the device available again.
+#[tokio::test]
+async fn recovery_publishes_on_before_online_after_suspended_retained_state() {
+    let broker = broker_or_skip!();
+    let config = test_config(broker.port());
+    let state_topic = StatusComponent::state_topic_for(&config.hostname);
+    let availability_topic = config.status_topic();
+
+    let mqtt_client = MqttClient::new(&config).expect("create MqttClient");
+    let mqtt_control = mqtt_client.control_handle();
+    let (event_tx, mut event_rx) = mpsc::channel::<MqttEvent>(100);
+    let (_action_tx, action_rx) = mpsc::channel(100);
+
+    tokio::spawn(mqtt_client.run(event_tx, action_rx));
+    wait_for_connected(&mut event_rx).await;
+
+    let (seed_client, mut seed_eventloop) =
+        connected_helper_client(broker.port(), "seed-power").await;
+    publish_and_flush(
+        &seed_client,
+        &mut seed_eventloop,
+        &state_topic,
+        true,
+        StatusComponent::payload(StatusValue::Suspended).as_bytes(),
+    )
+    .await;
+    publish_and_flush(
+        &seed_client,
+        &mut seed_eventloop,
+        &availability_topic,
+        true,
+        b"offline",
+    )
+    .await;
+
+    let (sub_client, mut sub_eventloop) =
+        connected_helper_client(broker.port(), "recovery-watch").await;
+    subscribe_and_wait(&sub_client, &mut sub_eventloop, &state_topic).await;
+    subscribe_and_wait(&sub_client, &mut sub_eventloop, &availability_topic).await;
+
+    let initial_retained = wait_for_publishes(&mut sub_eventloop, 2, Duration::from_secs(3)).await;
+    assert_eq!(initial_retained.len(), 2);
+    assert!(initial_retained.contains(&(
+        state_topic.clone(),
+        StatusComponent::payload(StatusValue::Suspended),
+    )));
+    assert!(initial_retained.contains(&(availability_topic.clone(), "offline".to_string())));
+
+    assert_eq!(
+        mqtt_control
+            .publish_retained_tracked(
+                state_topic.clone(),
+                StatusComponent::payload(StatusValue::On),
+                Duration::from_secs(2),
+            )
+            .await,
+        hars_imp::mqtt::client::TrackedPublishResult::Acked
+    );
+    assert_eq!(
+        mqtt_control
+            .publish_retained_tracked(availability_topic.clone(), "online", Duration::from_secs(2),)
+            .await,
+        hars_imp::mqtt::client::TrackedPublishResult::Acked
+    );
+
+    let recovery_publishes =
+        wait_for_publishes(&mut sub_eventloop, 2, Duration::from_secs(3)).await;
+    assert_eq!(
+        recovery_publishes,
+        vec![
+            (state_topic, StatusComponent::payload(StatusValue::On)),
+            (availability_topic, "online".to_string()),
+        ]
+    );
+}
+
 /// Test: Full component lifecycle — register components, build discovery JSON,
 /// connect to broker, publish discovery, subscribe, and route an inbound message.
 #[tokio::test]
@@ -912,6 +988,30 @@ async fn wait_for_publish(
     })
     .await
     .expect("timeout waiting for publish")
+}
+
+async fn wait_for_publishes(
+    eventloop: &mut rumqttc::EventLoop,
+    count: usize,
+    wait: Duration,
+) -> Vec<(String, String)> {
+    timeout(wait, async {
+        let mut publishes = Vec::with_capacity(count);
+
+        while publishes.len() < count {
+            let event = eventloop.poll().await.expect("helper poll");
+            if let Event::Incoming(Packet::Publish(publish)) = event {
+                publishes.push((
+                    publish.topic,
+                    String::from_utf8_lossy(&publish.payload).to_string(),
+                ));
+            }
+        }
+
+        publishes
+    })
+    .await
+    .expect("timeout waiting for publishes")
 }
 
 async fn wait_for_mqtt_message(

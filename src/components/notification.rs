@@ -17,13 +17,21 @@ struct NotificationPayload {
     /// Notification body text.
     message: String,
 
-    /// Urgency level: "low", "normal", "critical".
+    /// Urgency level: "low", "normal", "high", "critical".
     #[serde(default = "default_importance")]
     importance: String,
 }
 
 fn default_importance() -> String {
     "normal".to_string()
+}
+
+fn urgency_from_importance(importance: &str) -> u8 {
+    match importance {
+        "low" => 0u8,
+        "high" | "critical" => 2u8,
+        _ => 1u8, // normal
+    }
 }
 
 /// A notification entity that forwards HA notifications to the Linux desktop.
@@ -81,11 +89,7 @@ impl Component for NotificationComponent {
             }
         };
 
-        let urgency = match notification.importance.as_str() {
-            "low" => 0u8,
-            "critical" => 2u8,
-            _ => 1u8, // normal
-        };
+        let urgency = urgency_from_importance(&notification.importance);
 
         // Try to send the desktop notification via session D-Bus.
         match crate::dbus::client::session_connection().await {
