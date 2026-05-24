@@ -194,6 +194,7 @@ impl Orchestrator {
         let system_monitor = Arc::new(SystemMonitorComponent::new(
             &self.config.hostname,
             self.config.update_interval_secs,
+            &self.config.ambient_light_monitor,
         ));
         info!("Registering system monitor");
         registry.register(system_monitor);
@@ -664,6 +665,7 @@ mod tests {
             password: "pass".to_string(),
             log_level: "info".to_string(),
             update_interval_secs: 60,
+            ambient_light_monitor: crate::config::AmbientLightMonitorConfig::default(),
             button: vec![],
             switch: vec![],
             tls: None,

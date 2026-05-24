@@ -10,7 +10,9 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
+use crate::components::ambient_light::AmbientLightMonitor;
 use crate::components::trait_def::{ActionMessage, Component, OutboundMessage};
+use crate::config::AmbientLightMonitorConfig;
 use crate::mqtt::discovery::{ComponentType, HomeAssistantComponent};
 
 const BYTES_TO_GB: f32 = 1024.0 * 1024.0 * 1024.0;
@@ -28,6 +30,8 @@ pub struct SystemPerformanceData {
     pub disk_total: f32,
     pub disk_free: f32,
     pub disk_free_percentage: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambient_light: Option<f32>,
 }
 
 impl SystemPerformanceData {
@@ -63,6 +67,7 @@ impl SystemPerformanceData {
             disk_total: round_to_2dp(disk_metrics.total_gb),
             disk_free: round_to_2dp(disk_metrics.free_gb),
             disk_free_percentage: round_to_2dp(disk_metrics.free_percentage),
+            ambient_light: None,
         }
     }
 }
@@ -135,7 +140,11 @@ impl SystemMonitorState {
         }
     }
 
-    async fn sample(&mut self, shutdown: &CancellationToken) -> Option<SystemPerformanceData> {
+    async fn sample(
+        &mut self,
+        shutdown: &CancellationToken,
+        ambient_light_monitor: Option<&AmbientLightMonitor>,
+    ) -> Option<SystemPerformanceData> {
         tokio::select! {
             _ = shutdown.cancelled() => return None,
             _ = tokio::time::sleep(CPU_REFRESH_DELAY) => {}
@@ -145,10 +154,18 @@ impl SystemMonitorState {
         self.disks.refresh_specifics(false, disk_refresh_kind());
 
         let disk_metrics = self.disk_metrics();
-        Some(SystemPerformanceData::from_system_and_disk(
-            &self.system,
-            disk_metrics,
-        ))
+        let mut performance =
+            SystemPerformanceData::from_system_and_disk(&self.system, disk_metrics);
+        performance.ambient_light =
+            ambient_light_monitor.and_then(|monitor| match monitor.read_value() {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    debug!("Skipping ambient light sample: {err}");
+                    None
+                }
+            });
+
+        Some(performance)
     }
 
     fn disk_metrics(&self) -> DiskMetrics {
@@ -170,14 +187,32 @@ pub struct SystemMonitorComponent {
     hostname: String,
     state_topic: String,
     update_interval: Duration,
+    ambient_light_monitor: Option<AmbientLightMonitor>,
 }
 
 impl SystemMonitorComponent {
-    pub fn new(hostname: &str, update_interval_secs: u64) -> Self {
+    pub fn new(
+        hostname: &str,
+        update_interval_secs: u64,
+        ambient_light_config: &AmbientLightMonitorConfig,
+    ) -> Self {
+        Self::with_source(
+            hostname,
+            Duration::from_secs(update_interval_secs),
+            AmbientLightMonitor::from_config(ambient_light_config),
+        )
+    }
+
+    fn with_source(
+        hostname: &str,
+        update_interval: Duration,
+        ambient_light_monitor: Option<AmbientLightMonitor>,
+    ) -> Self {
         Self {
             hostname: hostname.to_string(),
             state_topic: format!("homeassistant/sensor/{hostname}/system_performance/state"),
-            update_interval: Duration::from_secs(update_interval_secs),
+            update_interval,
+            ambient_light_monitor,
         }
     }
 
@@ -207,7 +242,7 @@ impl Component for SystemMonitorComponent {
     }
 
     fn discovery_components(&self) -> Vec<(String, HomeAssistantComponent)> {
-        SYSTEM_METRICS
+        let mut components: Vec<_> = SYSTEM_METRICS
             .iter()
             .map(|metric| {
                 (
@@ -215,7 +250,14 @@ impl Component for SystemMonitorComponent {
                     self.discovery_for_metric(*metric),
                 )
             })
-            .collect()
+            .collect();
+
+        if let Some(ambient_light_monitor) = &self.ambient_light_monitor {
+            components
+                .push(ambient_light_monitor.discovery_component(&self.hostname, &self.state_topic));
+        }
+
+        components
     }
 
     fn spawn_polling(
@@ -225,6 +267,7 @@ impl Component for SystemMonitorComponent {
     ) -> Option<JoinHandle<()>> {
         let state_topic = self.state_topic.clone();
         let interval = self.update_interval;
+        let ambient_light_monitor = self.ambient_light_monitor.clone();
 
         Some(tokio::spawn(async move {
             let mut state = SystemMonitorState::new();
@@ -238,7 +281,7 @@ impl Component for SystemMonitorComponent {
                         return;
                     }
                     _ = ticker.tick() => {
-                        let Some(performance) = state.sample(&shutdown).await else {
+                        let Some(performance) = state.sample(&shutdown, ambient_light_monitor.as_ref()).await else {
                             debug!("System monitor polling task shutting down");
                             return;
                         };
@@ -320,6 +363,8 @@ fn round_to_2dp(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::ambient_light::AMBIENT_LIGHT_METRIC_KEY;
+    use tempfile::tempdir;
 
     #[test]
     fn system_performance_serializes_old_field_names() {
@@ -332,6 +377,7 @@ mod tests {
             disk_total: 512.0,
             disk_free: 128.0,
             disk_free_percentage: 25.0,
+            ambient_light: Some(321.0),
         };
 
         let value = serde_json::to_value(payload).expect("serialize metrics");
@@ -343,11 +389,18 @@ mod tests {
         assert!(value.get("disk_total").is_some());
         assert!(value.get("disk_free").is_some());
         assert!(value.get("disk_free_percentage").is_some());
+        assert_eq!(
+            value
+                .get(AMBIENT_LIGHT_METRIC_KEY)
+                .and_then(|value| value.as_f64()),
+            Some(321.0)
+        );
     }
 
     #[test]
     fn system_monitor_discovery_uses_single_state_topic_with_templates() {
-        let monitor = SystemMonitorComponent::new("testhost", 60);
+        let monitor =
+            SystemMonitorComponent::new("testhost", 60, &AmbientLightMonitorConfig::default());
         let entries = monitor.discovery_components();
 
         assert_eq!(entries.len(), 8);
@@ -396,7 +449,11 @@ mod tests {
 
     #[tokio::test]
     async fn system_monitor_publishes_first_update_without_waiting_for_interval() {
-        let monitor = Arc::new(SystemMonitorComponent::new("testhost", 60));
+        let monitor = Arc::new(SystemMonitorComponent::new(
+            "testhost",
+            60,
+            &AmbientLightMonitorConfig::default(),
+        ));
         let (tx, mut rx) = mpsc::channel(1);
         let shutdown = CancellationToken::new();
         let handle = Arc::clone(&monitor)
@@ -430,5 +487,54 @@ mod tests {
         ] {
             assert!(payload.get(field).is_some(), "missing field {field}");
         }
+        assert!(payload.get(AMBIENT_LIGHT_METRIC_KEY).is_none());
+    }
+
+    #[tokio::test]
+    async fn system_monitor_omits_ambient_light_after_read_failure_but_keeps_publishing() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("iio:device0").join("in_illuminance_input");
+        std::fs::create_dir_all(path.parent().expect("ambient light parent")).unwrap();
+        std::fs::write(&path, "111.11\n").unwrap();
+
+        let source = AmbientLightMonitor::explicit(path.clone()).expect("ambient light source");
+        let monitor = Arc::new(SystemMonitorComponent::with_source(
+            "testhost",
+            Duration::from_millis(50),
+            Some(source),
+        ));
+        let (tx, mut rx) = mpsc::channel(4);
+        let shutdown = CancellationToken::new();
+        let handle = Arc::clone(&monitor)
+            .spawn_polling(tx, shutdown.clone())
+            .expect("system monitor should spawn polling task");
+
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("first update should arrive promptly")
+            .expect("first message");
+        let first_payload: serde_json::Value =
+            serde_json::from_str(first.payload()).expect("payload should be valid JSON");
+        assert_eq!(
+            first_payload
+                .get(AMBIENT_LIGHT_METRIC_KEY)
+                .and_then(|value| value.as_f64()),
+            Some(111.11)
+        );
+
+        std::fs::remove_file(&path).expect("remove ambient light file");
+
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("second update should still arrive")
+            .expect("second message");
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        let second_payload: serde_json::Value =
+            serde_json::from_str(second.payload()).expect("payload should be valid JSON");
+        assert!(second_payload.get("cpu_load").is_some());
+        assert!(second_payload.get(AMBIENT_LIGHT_METRIC_KEY).is_none());
     }
 }

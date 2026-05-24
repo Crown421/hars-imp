@@ -1,3 +1,4 @@
+mod ambient_light;
 pub mod button;
 pub mod notification;
 pub mod registry;

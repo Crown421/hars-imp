@@ -36,6 +36,10 @@ pub struct Config {
     #[serde(default = "default_update_interval")]
     pub update_interval_secs: u64,
 
+    /// Optional ambient light monitoring configuration.
+    #[serde(default)]
+    pub ambient_light_monitor: AmbientLightMonitorConfig,
+
     /// Button definitions.
     #[serde(default)]
     pub button: Vec<ButtonConfig>,
@@ -61,6 +65,17 @@ pub struct TlsConfig {
 
     /// Path to a PEM-encoded client private key file (for mTLS).
     pub client_key: Option<String>,
+}
+
+/// Configuration for the optional ambient light sensor monitor.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AmbientLightMonitorConfig {
+    /// Enable ambient light monitoring.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Optional explicit sysfs value path to use for ambient light reads.
+    pub path: Option<String>,
 }
 
 /// Configuration for a button entity.
@@ -305,6 +320,8 @@ password = "pass"
         assert_eq!(config.effective_mqtt_port(), 1883);
         assert_eq!(config.log_level, "info");
         assert_eq!(config.update_interval_secs, 60);
+        assert!(!config.ambient_light_monitor.enabled);
+        assert!(config.ambient_light_monitor.path.is_none());
         assert!(config.button.is_empty());
         assert!(config.switch.is_empty());
         assert!(config.tls.is_none());
@@ -325,6 +342,65 @@ update_interval_secs = 10
         assert_eq!(config.mqtt_port, Some(9999));
         assert_eq!(config.log_level, "debug");
         assert_eq!(config.update_interval_secs, 10);
+    }
+
+    #[test]
+    fn parse_ambient_light_monitor_with_explicit_path() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[ambient_light_monitor]
+enabled = true
+path = "/sys/bus/iio/devices/iio:device0/in_illuminance_input"
+"#;
+
+        let config = load_toml(toml).expect("should parse");
+        assert!(config.ambient_light_monitor.enabled);
+        assert_eq!(
+            config.ambient_light_monitor.path.as_deref(),
+            Some("/sys/bus/iio/devices/iio:device0/in_illuminance_input")
+        );
+    }
+
+    #[test]
+    fn parse_ambient_light_monitor_enabled_without_path() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[ambient_light_monitor]
+enabled = true
+"#;
+
+        let config = load_toml(toml).expect("should parse");
+        assert!(config.ambient_light_monitor.enabled);
+        assert!(config.ambient_light_monitor.path.is_none());
+    }
+
+    #[test]
+    fn parse_ambient_light_monitor_with_explicit_raw_path() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[ambient_light_monitor]
+enabled = true
+path = "/sys/bus/iio/devices/iio:device0/in_illuminance_raw"
+"#;
+
+        let config = load_toml(toml).expect("should parse");
+        assert!(config.ambient_light_monitor.enabled);
+        assert_eq!(
+            config.ambient_light_monitor.path.as_deref(),
+            Some("/sys/bus/iio/devices/iio:device0/in_illuminance_raw")
+        );
     }
 
     #[test]

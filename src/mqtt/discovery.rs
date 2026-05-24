@@ -183,6 +183,7 @@ impl DeviceDiscoveryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AmbientLightMonitorConfig;
 
     /// Helper: create a minimal Config for testing.
     fn test_config() -> Config {
@@ -194,6 +195,7 @@ mod tests {
             password: "pass".to_string(),
             log_level: "info".to_string(),
             update_interval_secs: 60,
+            ambient_light_monitor: AmbientLightMonitorConfig::default(),
             button: vec![],
             switch: vec![],
             tls: None,
