@@ -84,6 +84,12 @@ pub struct SwitchConfig {
 
     /// D-Bus method call spec (mutually exclusive with `exec`).
     pub dbus: Option<DbusActionConfig>,
+
+    /// Optional shell command to read the current switch state.
+    pub status_exec: Option<String>,
+
+    /// Optional D-Bus method call spec to read the current switch state.
+    pub status_dbus: Option<DbusActionConfig>,
 }
 
 /// D-Bus method call specification for a switch.
@@ -180,6 +186,12 @@ impl Config {
             if sw.exec.is_some() && sw.dbus.is_some() {
                 return Err(ConfigError::Validation(format!(
                     "Switch '{}' cannot have both 'exec' and 'dbus' defined",
+                    sw.name
+                )));
+            }
+            if sw.status_exec.is_some() && sw.status_dbus.is_some() {
+                return Err(ConfigError::Validation(format!(
+                    "Switch '{}' cannot have both 'status_exec' and 'status_dbus' defined",
                     sw.name
                 )));
             }
@@ -488,6 +500,7 @@ exec = "systemctl reboot"
 [[switch]]
 name = "Night Light"
 exec = "toggle-nightlight"
+status_exec = "printf OFF"
 "#;
         let config = load_toml(toml).unwrap();
         assert_eq!(config.button.len(), 2);
@@ -495,6 +508,90 @@ exec = "toggle-nightlight"
         assert_eq!(config.button[1].exec, "systemctl reboot");
         assert_eq!(config.switch.len(), 1);
         assert_eq!(config.switch[0].name, "Night Light");
+        assert_eq!(config.switch[0].status_exec.as_deref(), Some("printf OFF"));
+    }
+
+    #[test]
+    fn parse_switch_status_dbus() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[[switch]]
+name = "Idle Inhibit"
+exec = "toggle-inhibit"
+[switch.status_dbus]
+service = "org.example.Idle"
+path = "/org/example/Idle"
+interface = "org.example.Idle"
+method = "GetInhibit"
+"#;
+        let config = load_toml(toml).unwrap();
+        let status_dbus = config.switch[0].status_dbus.as_ref().unwrap();
+        assert_eq!(status_dbus.service, "org.example.Idle");
+        assert_eq!(status_dbus.method, "GetInhibit");
+    }
+
+    #[test]
+    fn validation_switch_both_status_backends_rejected() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[[switch]]
+name = "Bad Switch"
+exec = "echo hi"
+status_exec = "printf ON"
+[switch.status_dbus]
+service = "org.test"
+path = "/test"
+interface = "org.test.iface"
+method = "GetState"
+"#;
+        let err = load_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("status_exec") || msg.contains("status_dbus"),
+            "Error should mention status backends: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_switch_allows_mixed_action_and_status_backends() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[[switch]]
+name = "Mixed Switch"
+exec = "toggle-switch"
+[switch.status_dbus]
+service = "org.test"
+path = "/test"
+interface = "org.test.iface"
+method = "GetState"
+
+[[switch]]
+name = "Other Mixed Switch"
+status_exec = "printf OFF"
+[switch.dbus]
+service = "org.test"
+path = "/test"
+interface = "org.test.iface"
+method = "SetState"
+"#;
+        let config = load_toml(toml).unwrap();
+        assert_eq!(config.switch.len(), 2);
+        assert!(config.switch[0].exec.is_some());
+        assert!(config.switch[0].status_dbus.is_some());
+        assert!(config.switch[1].dbus.is_some());
+        assert_eq!(config.switch[1].status_exec.as_deref(), Some("printf OFF"));
     }
 
     #[test]

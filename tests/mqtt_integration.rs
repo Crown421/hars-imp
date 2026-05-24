@@ -523,6 +523,8 @@ async fn full_component_lifecycle() {
         name: "Test Switch".to_string(),
         exec: Some("true".to_string()),
         dbus: None,
+        status_exec: None,
+        status_dbus: None,
     });
 
     // --- Build registry ---
@@ -664,6 +666,8 @@ async fn switch_state_round_trip() {
         name: "Round Trip Switch".to_string(),
         exec: Some("true".to_string()),
         dbus: None,
+        status_exec: None,
+        status_dbus: None,
     };
     let switch = Arc::new(SwitchComponent::new(&sw_config, &config.hostname));
     let state_topic = format!(
@@ -710,16 +714,35 @@ async fn switch_state_round_trip() {
     assert_eq!(state_msg, "OFF");
 }
 
-/// Test: on_resume re-publishes switch state correctly.
+/// Test: on_resume re-publishes the real switch state from readback.
 #[tokio::test]
-async fn on_resume_publishes_switch_state() {
+async fn on_resume_publishes_switch_readback_state() {
     let broker = broker_or_skip!();
     let config = test_config(broker.port());
+    let dir = tempfile::tempdir().unwrap();
+    let state_file = dir.path().join("resume-state.txt");
+    std::fs::write(&state_file, "OFF").unwrap();
+    let action_script = dir.path().join("set-state.sh");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"on\" ]; then\n  printf ON > \"{}\"\nelse\n  printf OFF > \"{}\"\nfi\n",
+        state_file.display(),
+        state_file.display()
+    );
+    std::fs::write(&action_script, script).unwrap();
+    let mut permissions = std::fs::metadata(&action_script).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+    }
+    std::fs::set_permissions(&action_script, permissions).unwrap();
 
     let sw_config = SwitchConfig {
         name: "Resume Switch".to_string(),
-        exec: Some("true".to_string()),
+        exec: Some(action_script.display().to_string()),
         dbus: None,
+        status_exec: Some(format!("cat {}", state_file.display())),
+        status_dbus: None,
     };
     let switch = Arc::new(SwitchComponent::new(&sw_config, &config.hostname));
     let state_topic = format!(
@@ -744,19 +767,22 @@ async fn on_resume_publishes_switch_state() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Turn switch ON first.
+    // Turn switch ON first so the cached state and readback are both ON.
     switch.handle_message("ignored", "ON", &action_tx).await;
 
     // Consume the ON state publish.
     let _ = wait_for_mqtt_message(&mut event_rx, Some(&state_topic), Duration::from_secs(2)).await;
 
-    // Now simulate resume — should re-publish ON.
+    // Change the underlying state out of band.
+    std::fs::write(&state_file, "OFF").unwrap();
+
+    // Now simulate resume — should re-publish the readback OFF.
     switch.on_resume(&action_tx).await;
 
     let (_, state_msg) =
         wait_for_mqtt_message(&mut event_rx, Some(&state_topic), Duration::from_secs(3)).await;
 
-    assert_eq!(state_msg, "ON");
+    assert_eq!(state_msg, "OFF");
 }
 
 /// Test: ComponentRegistry correctly routes messages from MQTT to the right component.
@@ -771,6 +797,8 @@ async fn registry_routes_mqtt_messages_to_components() {
         name: "Routed Switch".to_string(),
         exec: Some("true".to_string()),
         dbus: None,
+        status_exec: None,
+        status_dbus: None,
     };
     let switch = Arc::new(SwitchComponent::new(&sw_config, &config.hostname));
     let switch_cmd_topic = format!(
