@@ -2,6 +2,7 @@
 //!
 //! This library crate exposes the application's modules for integration testing.
 
+pub(crate) mod accelerator;
 pub mod components;
 pub mod config;
 pub mod dbus;

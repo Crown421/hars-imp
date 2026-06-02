@@ -1,3 +1,4 @@
+pub mod accelerator_monitor;
 mod ambient_light;
 pub mod button;
 pub mod notification;

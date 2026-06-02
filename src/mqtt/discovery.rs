@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use serde::Serialize;
 
@@ -8,7 +9,7 @@ use crate::util::version;
 /// A single HA entity's discovery configuration.
 ///
 /// This is the value in the `cmps` map of the device discovery payload.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HomeAssistantComponent {
     /// Display name in HA.
     pub name: String,
@@ -24,7 +25,7 @@ pub struct HomeAssistantComponent {
 /// Type-specific fields for each HA platform.
 ///
 /// The `p` field (platform) is the HA component type identifier.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "p", rename_all = "lowercase")]
 pub enum ComponentType {
     /// A button entity — receives press commands.
@@ -122,6 +123,11 @@ pub struct DeviceDiscoveryBuilder {
     status_topic: Option<String>,
 }
 
+/// Shared mutable discovery catalog used for retained discovery republishes.
+pub struct DiscoveryCatalog {
+    components: Mutex<HashMap<String, HomeAssistantComponent>>,
+}
+
 impl DeviceDiscoveryBuilder {
     /// Create a new builder from application config.
     pub fn new(config: &Config) -> Self {
@@ -180,10 +186,91 @@ impl DeviceDiscoveryBuilder {
     }
 }
 
+impl DiscoveryCatalog {
+    pub fn new(
+        components: impl IntoIterator<Item = (String, HomeAssistantComponent)>,
+    ) -> Result<Self, crate::error::ComponentError> {
+        let mut catalog = HashMap::new();
+        for (key, component) in components {
+            insert_discovery_component(&mut catalog, key, component)?;
+        }
+
+        Ok(Self {
+            components: Mutex::new(catalog),
+        })
+    }
+
+    pub fn upsert_components(
+        &self,
+        components: impl IntoIterator<Item = (String, HomeAssistantComponent)>,
+    ) -> Result<(), crate::error::ComponentError> {
+        let mut catalog = self
+            .components
+            .lock()
+            .expect("discovery catalog mutex should not be poisoned");
+        let mut staged = catalog.clone();
+
+        for (key, component) in components {
+            match staged.get(&key) {
+                Some(existing) if existing == &component => {}
+                Some(_) => {
+                    return Err(crate::error::ComponentError::DiscoveryConflict(format!(
+                        "duplicate discovery key '{key}'"
+                    )));
+                }
+                None => {
+                    insert_discovery_component(&mut staged, key, component)?;
+                }
+            }
+        }
+
+        *catalog = staged;
+        Ok(())
+    }
+
+    pub fn serialize_current(&self, config: &Config) -> Result<String, crate::error::AppError> {
+        let components = self
+            .components
+            .lock()
+            .expect("discovery catalog mutex should not be poisoned")
+            .clone();
+
+        let discovery = DeviceDiscoveryBuilder::new(config)
+            .add_components(components)
+            .with_status_topic(config.status_topic())
+            .build();
+
+        serde_json::to_string(&discovery)
+            .map_err(crate::error::MqttError::Serialization)
+            .map_err(Box::new)
+            .map_err(Into::into)
+    }
+}
+
+fn insert_discovery_component(
+    catalog: &mut HashMap<String, HomeAssistantComponent>,
+    key: String,
+    component: HomeAssistantComponent,
+) -> Result<(), crate::error::ComponentError> {
+    if key.is_empty() {
+        return Err(crate::error::ComponentError::DiscoveryConflict(
+            "component produced an empty discovery key".to_string(),
+        ));
+    }
+
+    if catalog.insert(key.clone(), component).is_some() {
+        return Err(crate::error::ComponentError::DiscoveryConflict(format!(
+            "duplicate discovery key '{key}'"
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AmbientLightMonitorConfig;
+    use crate::config::{AcceleratorMonitorConfig, AmbientLightMonitorConfig};
 
     /// Helper: create a minimal Config for testing.
     fn test_config() -> Config {
@@ -196,9 +283,20 @@ mod tests {
             log_level: "info".to_string(),
             update_interval_secs: 60,
             ambient_light_monitor: AmbientLightMonitorConfig::default(),
+            accelerator_monitor: AcceleratorMonitorConfig::default(),
             button: vec![],
             switch: vec![],
             tls: None,
+        }
+    }
+
+    fn button_component(name: &str, topic: &str) -> HomeAssistantComponent {
+        HomeAssistantComponent {
+            name: name.to_string(),
+            unique_id: format!("testhost_{}", name.to_lowercase().replace(' ', "_")),
+            component_type: ComponentType::Button {
+                command_topic: topic.to_string(),
+            },
         }
     }
 
@@ -394,6 +492,59 @@ mod tests {
         let cpu = &parsed["cmps"]["cpu"];
         assert_eq!(cpu["p"], "sensor");
         assert_eq!(cpu["unit_of_measurement"], "%");
+    }
+
+    #[test]
+    fn discovery_catalog_upsert_is_atomic_on_conflict() {
+        let catalog = DiscoveryCatalog::new(vec![(
+            "existing".to_string(),
+            button_component("Existing", "topic/existing"),
+        )])
+        .expect("catalog should build");
+
+        let err = catalog
+            .upsert_components(vec![
+                (
+                    "new_one".to_string(),
+                    button_component("New One", "topic/new_one"),
+                ),
+                (
+                    "existing".to_string(),
+                    button_component("Conflicting Existing", "topic/conflict"),
+                ),
+            ])
+            .expect_err("batch should conflict");
+        assert!(err
+            .to_string()
+            .contains("duplicate discovery key 'existing'"));
+
+        let json = catalog
+            .serialize_current(&test_config())
+            .expect("serialize catalog");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse catalog");
+        let cmps = parsed["cmps"].as_object().expect("components object");
+        assert!(cmps.contains_key("existing"));
+        assert!(!cmps.contains_key("new_one"));
+    }
+
+    #[test]
+    fn discovery_catalog_allows_idempotent_reupsert() {
+        let component = button_component("Existing", "topic/existing");
+        let catalog = DiscoveryCatalog::new(vec![("existing".to_string(), component.clone())])
+            .expect("catalog should build");
+
+        catalog
+            .upsert_components(vec![("existing".to_string(), component)])
+            .expect("identical re-upsert should succeed");
+
+        let json = catalog
+            .serialize_current(&test_config())
+            .expect("serialize catalog");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse catalog");
+        assert_eq!(
+            parsed["cmps"].as_object().expect("components object").len(),
+            1
+        );
     }
 
     #[test]

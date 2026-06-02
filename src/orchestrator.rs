@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +7,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::components::accelerator_monitor::AcceleratorMonitorService;
 use crate::components::notification::NotificationComponent;
 use crate::components::registry::ComponentRegistry;
 use crate::components::status::{StatusComponent, StatusValue};
@@ -19,7 +19,7 @@ use crate::dbus::power::{PowerEvent, PowerMonitorSupervisor};
 use crate::mqtt::client::{
     subscribe_topics, MqttClient, MqttControlHandle, MqttEvent, TrackedPublishResult,
 };
-use crate::mqtt::discovery::DeviceDiscoveryBuilder;
+use crate::mqtt::discovery::DiscoveryCatalog;
 
 const CRITICAL_PUBLISH_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const RECONNECT_SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -34,6 +34,7 @@ struct MainLoopState<'a> {
     power_rx: mpsc::Receiver<PowerEvent>,
     mqtt_control: &'a MqttControlHandle,
     registry: &'a ComponentRegistry,
+    accelerator_monitor: Option<&'a AcceleratorMonitorService>,
     action_tx: &'a mpsc::Sender<ActionMessage>,
     sync_tx: &'a mpsc::Sender<()>,
     polling_shutdown: &'a mut CancellationToken,
@@ -45,7 +46,7 @@ struct ReconnectSyncWorkerContext {
     registry: Arc<ComponentRegistry>,
     client: rumqttc::AsyncClient,
     mqtt_control: MqttControlHandle,
-    discovery_json: String,
+    discovery_catalog: Arc<DiscoveryCatalog>,
     action_tx: mpsc::Sender<ActionMessage>,
 }
 
@@ -102,7 +103,7 @@ impl Orchestrator {
         let process_shutdown_hold = power_supervisor.shutdown_delay_hold();
 
         // --- Prepare discovery payload ---
-        let discovery_json = self.build_discovery_json(&registry)?;
+        let discovery_catalog = Arc::new(self.build_discovery_catalog(&registry)?);
 
         // --- Spawn MQTT event loop ---
         let _mqtt_handle = tokio::spawn(mqtt_client.run(event_tx, action_rx));
@@ -115,11 +116,17 @@ impl Orchestrator {
                 registry: Arc::clone(&registry),
                 client: mqtt_async_client.clone(),
                 mqtt_control: mqtt_control.clone(),
-                discovery_json: discovery_json.clone(),
+                discovery_catalog: Arc::clone(&discovery_catalog),
                 action_tx: action_tx.clone(),
             },
             sync_rx,
             sync_shutdown.clone(),
+        );
+
+        let accelerator_monitor = AcceleratorMonitorService::spawn(
+            &self.config,
+            Arc::clone(&discovery_catalog),
+            action_tx.clone(),
         );
 
         // --- Cancellation token for polling tasks ---
@@ -135,6 +142,7 @@ impl Orchestrator {
                 power_rx,
                 mqtt_control: &mqtt_control,
                 registry: &registry,
+                accelerator_monitor: accelerator_monitor.as_ref(),
                 action_tx: &action_tx,
                 sync_tx: &sync_tx,
                 polling_shutdown: &mut polling_shutdown,
@@ -147,6 +155,9 @@ impl Orchestrator {
         polling_shutdown.cancel();
         sync_shutdown.cancel();
         await_task("reconnect sync worker", sync_handle).await;
+        if let Some(accelerator_monitor) = accelerator_monitor {
+            await_task("accelerator monitor", accelerator_monitor.shutdown()).await;
+        }
         let MainLoopExit::Signal {
             shutdown_already_published,
         } = exit;
@@ -200,46 +211,19 @@ impl Orchestrator {
         registry.register(system_monitor);
     }
 
-    /// Build the HA device discovery JSON payload.
-    fn build_discovery_json(
+    fn build_discovery_catalog(
         &self,
         registry: &ComponentRegistry,
-    ) -> Result<String, crate::error::AppError> {
-        let mut seen_keys = HashSet::new();
+    ) -> Result<DiscoveryCatalog, crate::error::AppError> {
         let mut components = Vec::new();
 
         for component in registry.components() {
             for (key, discovery_component) in component.discovery_components() {
-                if key.is_empty() {
-                    return Err(crate::error::ComponentError::DiscoveryConflict(format!(
-                        "component '{}' produced an empty discovery key",
-                        component.name()
-                    ))
-                    .into());
-                }
-
-                if !seen_keys.insert(key.clone()) {
-                    return Err(crate::error::ComponentError::DiscoveryConflict(format!(
-                        "duplicate discovery key '{key}' from component '{}'",
-                        component.name()
-                    ))
-                    .into());
-                }
-
                 components.push((key, discovery_component));
             }
         }
 
-        let discovery = DeviceDiscoveryBuilder::new(&self.config)
-            .add_components(components)
-            .with_status_topic(self.config.status_topic())
-            .build();
-
-        let json = serde_json::to_string(&discovery)
-            .map_err(crate::error::MqttError::Serialization)
-            .map_err(Box::new)?;
-
-        Ok(json)
+        DiscoveryCatalog::new(components).map_err(Into::into)
     }
 
     /// The main event loop: select! over MQTT events, power events, and shutdown signals.
@@ -278,6 +262,9 @@ impl Orchestrator {
                             info!("Handling suspend");
                             // Cancel polling tasks.
                             state.polling_shutdown.cancel();
+                            if let Some(accelerator_monitor) = state.accelerator_monitor {
+                                accelerator_monitor.pause();
+                            }
 
                             match publish_suspend_state(&self.config, state.mqtt_control).await {
                                 TrackedPublishResult::Acked => {}
@@ -301,6 +288,9 @@ impl Orchestrator {
                                 state.action_tx.clone(),
                                 state.polling_shutdown.clone(),
                             );
+                            if let Some(accelerator_monitor) = state.accelerator_monitor {
+                                accelerator_monitor.resume();
+                            }
 
                             // Treat resume like the same reconnect/state synchronization
                             // flow used after initial startup or MQTT reconnect, even if
@@ -361,7 +351,7 @@ impl Orchestrator {
                 registry,
                 client,
                 mqtt_control,
-                discovery_json,
+                discovery_catalog,
                 action_tx,
             } = context;
 
@@ -379,7 +369,7 @@ impl Orchestrator {
                                 registry.as_ref(),
                                 &client,
                                 &mqtt_control,
-                                &discovery_json,
+                                discovery_catalog.as_ref(),
                                 &action_tx,
                             )
                         }).await;
@@ -396,13 +386,14 @@ async fn reconnect_sync_once(
     registry: &ComponentRegistry,
     client: &rumqttc::AsyncClient,
     mqtt_control: &MqttControlHandle,
-    discovery_json: &str,
+    discovery_catalog: &DiscoveryCatalog,
     action_tx: &mpsc::Sender<ActionMessage>,
 ) -> Result<(), crate::error::AppError> {
+    let discovery_json = discovery_catalog.serialize_current(config)?;
     require_tracked_publish(
         mqtt_control,
         &config.discovery_topic(),
-        discovery_json,
+        &discovery_json,
         RECONNECT_SYNC_ACK_TIMEOUT,
         "discovery payload",
     )
@@ -650,10 +641,17 @@ async fn await_task(name: &str, handle: JoinHandle<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accelerator::{
+        AcceleratorCollector, AcceleratorDeviceSnapshot, AcceleratorKind, AcceleratorMetricReading,
+        AcceleratorProvider, AcceleratorSnapshot,
+    };
+    use crate::components::trait_def::OutboundMessage;
+    use async_trait::async_trait;
     use serde_json::Value;
+    use std::collections::VecDeque;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     fn test_config() -> Config {
@@ -666,9 +664,42 @@ mod tests {
             log_level: "info".to_string(),
             update_interval_secs: 60,
             ambient_light_monitor: crate::config::AmbientLightMonitorConfig::default(),
+            accelerator_monitor: crate::config::AcceleratorMonitorConfig::default(),
             button: vec![],
             switch: vec![],
             tls: None,
+        }
+    }
+
+    struct FakeCollector {
+        samples: Mutex<VecDeque<Result<AcceleratorSnapshot, String>>>,
+    }
+
+    #[async_trait]
+    impl AcceleratorCollector for FakeCollector {
+        async fn collect(&self) -> Result<AcceleratorSnapshot, String> {
+            self.samples
+                .lock()
+                .expect("samples lock")
+                .pop_front()
+                .expect("sample should exist")
+        }
+
+        fn shutdown(&self) {}
+    }
+
+    fn accelerator_device(index: u32) -> AcceleratorDeviceSnapshot {
+        AcceleratorDeviceSnapshot {
+            provider: AcceleratorProvider::Nvidia,
+            kind: AcceleratorKind::Gpu,
+            index,
+            stable_key: format!("gpu_uuid_test_{index}"),
+            name: format!("GPU {index}"),
+            utilization_pct: AcceleratorMetricReading::Value(73.456),
+            memory_total_mb: AcceleratorMetricReading::Value(8192.0),
+            memory_used_mb: AcceleratorMetricReading::Value(4096.789),
+            temperature_c: AcceleratorMetricReading::Value(61.4),
+            power_w: AcceleratorMetricReading::Value(79.995),
         }
     }
 
@@ -728,6 +759,7 @@ mod tests {
                 power_rx,
                 mqtt_control: &mqtt_control,
                 registry: &registry,
+                accelerator_monitor: None,
                 action_tx: &action_tx,
                 sync_tx: &sync_tx,
                 polling_shutdown: &mut polling_shutdown,
@@ -767,6 +799,7 @@ mod tests {
             power_rx,
             mqtt_control: &mqtt_control,
             registry: &registry,
+            accelerator_monitor: None,
             action_tx: &action_tx,
             sync_tx: &sync_tx,
             polling_shutdown: &mut polling_shutdown,
@@ -796,8 +829,8 @@ mod tests {
         assert_eq!(publishes[1].payload, "online");
     }
 
-    #[test]
-    fn discovery_json_includes_status_sensor() {
+    #[tokio::test]
+    async fn discovery_json_includes_status_sensor() {
         let config = test_config();
         let orchestrator = Orchestrator::new(config.clone());
         let mut registry = ComponentRegistry::new();
@@ -805,7 +838,9 @@ mod tests {
         orchestrator.register_components(&mut registry);
 
         let json = orchestrator
-            .build_discovery_json(&registry)
+            .build_discovery_catalog(&registry)
+            .expect("build discovery catalog")
+            .serialize_current(&config)
             .expect("build discovery json");
         let parsed: Value = serde_json::from_str(&json).expect("parse discovery");
         let status = &parsed["cmps"]["testhost_status"];
@@ -816,5 +851,71 @@ mod tests {
             "homeassistant/sensor/testhost/status/state"
         );
         assert_eq!(status["value_template"], "{{ value_json.status }}");
+    }
+
+    #[tokio::test]
+    async fn accelerator_service_updates_shared_discovery_catalog() {
+        let mut config = test_config();
+        config.accelerator_monitor.enabled = true;
+        let orchestrator = Orchestrator::new(config.clone());
+        let mut registry = ComponentRegistry::new();
+        orchestrator.register_components(&mut registry);
+
+        let catalog = Arc::new(
+            orchestrator
+                .build_discovery_catalog(&registry)
+                .expect("build discovery catalog"),
+        );
+        let initial_json = catalog
+            .serialize_current(&config)
+            .expect("serialize initial catalog");
+        let initial: Value = serde_json::from_str(&initial_json).expect("parse discovery");
+        assert!(initial["cmps"]
+            .get("testhost_gpu_uuid_test_0_utilization")
+            .is_none());
+
+        let collector = Arc::new(FakeCollector {
+            samples: Mutex::new(VecDeque::from(vec![Ok(AcceleratorSnapshot {
+                devices: vec![accelerator_device(0)],
+            })])),
+        }) as Arc<dyn AcceleratorCollector>;
+        let (action_tx, mut action_rx) = mpsc::channel(4);
+        let service = AcceleratorMonitorService::spawn_with_collector(
+            &config,
+            Arc::clone(&catalog),
+            action_tx,
+            collector,
+        );
+
+        let discovery = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
+            .await
+            .expect("discovery should arrive")
+            .expect("message should exist");
+        let state = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
+            .await
+            .expect("state should arrive")
+            .expect("message should exist");
+        service
+            .shutdown()
+            .await
+            .expect("service should exit cleanly");
+
+        let OutboundMessage::Discovery { payload, .. } = discovery else {
+            panic!("first accelerator message should be discovery");
+        };
+        let discovery_payload: Value =
+            serde_json::from_str(&payload).expect("parse dynamic discovery");
+        assert!(discovery_payload["cmps"]
+            .get("testhost_gpu_uuid_test_0_utilization")
+            .is_some());
+        assert!(matches!(state, OutboundMessage::State { .. }));
+
+        let updated_json = catalog
+            .serialize_current(&config)
+            .expect("serialize updated catalog");
+        let updated: Value = serde_json::from_str(&updated_json).expect("parse updated catalog");
+        assert!(updated["cmps"]
+            .get("testhost_gpu_uuid_test_0_utilization")
+            .is_some());
     }
 }

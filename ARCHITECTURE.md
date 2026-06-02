@@ -19,6 +19,8 @@ src/
 ├── orchestrator.rs             # Central coordinator: spawns tasks, runs select! loop
 ├── config.rs                   # TOML config loading & validation
 ├── error.rs                    # Typed errors via thiserror
+├── accelerator/
+│   └── mod.rs                  # Accelerator backend abstraction + NVIDIA backend
 │
 ├── mqtt/
 │   ├── mod.rs                  # Re-exports
@@ -38,6 +40,7 @@ src/
 │   ├── button.rs               # ButtonComponent (config-driven, shell exec on PRESS)
 │   ├── switch.rs               # SwitchComponent (shell exec or D-Bus method call)
 │   ├── system_monitor.rs       # CPU, memory, disk sensors via sysinfo
+│   ├── accelerator_monitor.rs  # Optional accelerator metrics via provider backends
 │   └── notification.rs         # NotificationComponent (MQTT JSON → D-Bus notify)
 │
 └── util/

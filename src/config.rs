@@ -40,6 +40,10 @@ pub struct Config {
     #[serde(default)]
     pub ambient_light_monitor: AmbientLightMonitorConfig,
 
+    /// Optional accelerator monitoring configuration.
+    #[serde(default)]
+    pub accelerator_monitor: AcceleratorMonitorConfig,
+
     /// Button definitions.
     #[serde(default)]
     pub button: Vec<ButtonConfig>,
@@ -76,6 +80,26 @@ pub struct AmbientLightMonitorConfig {
 
     /// Optional explicit sysfs value path to use for ambient light reads.
     pub path: Option<String>,
+}
+
+/// Supported accelerator monitoring providers.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AcceleratorProviderConfig {
+    #[default]
+    Nvidia,
+}
+
+/// Configuration for the optional accelerator monitor.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AcceleratorMonitorConfig {
+    /// Enable accelerator monitoring.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Provider to initialize when accelerator monitoring is enabled.
+    #[serde(default)]
+    pub provider: AcceleratorProviderConfig,
 }
 
 /// Configuration for a button entity.
@@ -322,6 +346,11 @@ password = "pass"
         assert_eq!(config.update_interval_secs, 60);
         assert!(!config.ambient_light_monitor.enabled);
         assert!(config.ambient_light_monitor.path.is_none());
+        assert!(!config.accelerator_monitor.enabled);
+        assert_eq!(
+            config.accelerator_monitor.provider,
+            AcceleratorProviderConfig::Nvidia
+        );
         assert!(config.button.is_empty());
         assert!(config.switch.is_empty());
         assert!(config.tls.is_none());
@@ -400,6 +429,47 @@ path = "/sys/bus/iio/devices/iio:device0/in_illuminance_raw"
         assert_eq!(
             config.ambient_light_monitor.path.as_deref(),
             Some("/sys/bus/iio/devices/iio:device0/in_illuminance_raw")
+        );
+    }
+
+    #[test]
+    fn parse_accelerator_monitor_enabled_without_provider_defaults_to_nvidia() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[accelerator_monitor]
+enabled = true
+"#;
+
+        let config = load_toml(toml).expect("should parse");
+        assert!(config.accelerator_monitor.enabled);
+        assert_eq!(
+            config.accelerator_monitor.provider,
+            AcceleratorProviderConfig::Nvidia
+        );
+    }
+
+    #[test]
+    fn parse_accelerator_monitor_rejects_unknown_provider() {
+        let toml = r#"
+hostname = "host"
+mqtt_url = "broker"
+username = "u"
+password = "p"
+
+[accelerator_monitor]
+enabled = true
+provider = "amd"
+"#;
+
+        let err = load_toml(toml).expect_err("provider should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("provider"),
+            "Error should mention provider: {msg}"
         );
     }
 

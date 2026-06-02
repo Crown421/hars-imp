@@ -27,6 +27,7 @@ toml = "0.8"
 
 # System monitoring
 sysinfo = "0.33"
+nvml-wrapper = "0.12"
 
 # Logging
 tracing = "0.1"
@@ -40,6 +41,7 @@ thiserror = "2"
 async-trait = "0.1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 
 [package.metadata.generate-rpm]

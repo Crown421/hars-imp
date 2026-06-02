@@ -25,7 +25,9 @@ use hars_imp::components::registry::ComponentRegistry;
 use hars_imp::components::status::{StatusComponent, StatusValue};
 use hars_imp::components::switch::SwitchComponent;
 use hars_imp::components::trait_def::{Component, OutboundMessage};
-use hars_imp::config::{AmbientLightMonitorConfig, ButtonConfig, Config, SwitchConfig};
+use hars_imp::config::{
+    AcceleratorMonitorConfig, AmbientLightMonitorConfig, ButtonConfig, Config, SwitchConfig,
+};
 use hars_imp::mqtt::client::{MqttClient, MqttEvent};
 use hars_imp::mqtt::discovery::DeviceDiscoveryBuilder;
 use hars_imp::util::helpers::slugify;
@@ -145,6 +147,7 @@ fn test_config(port: u16) -> Config {
         log_level: "debug".to_string(),
         update_interval_secs: 60,
         ambient_light_monitor: AmbientLightMonitorConfig::default(),
+        accelerator_monitor: AcceleratorMonitorConfig::default(),
         button: vec![],
         switch: vec![],
         tls: None,
