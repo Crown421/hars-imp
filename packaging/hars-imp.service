@@ -1,0 +1,14 @@
+[Unit]
+Description=Home Assistant MQTT/D-Bus bridge
+Documentation=https://github.com/Crown421/hars-imp
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/hars-imp
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=graphical-session.target

@@ -13,6 +13,11 @@ jobs:
     permissions:
       contents: write
     steps:
+    - name: Install RPM tooling
+      run: |
+        apt-get update
+        apt-get install -y rpm
+
     - name: Checkout code
       uses: actions/checkout@v4
 
@@ -21,8 +26,27 @@ jobs:
       with:
         cache-on-failure: "true"
 
+    - name: Install cargo-generate-rpm
+      run: |
+        CARGO_GENERATE_RPM_VERSION="0.16.1"
+        if ! command -v cargo-generate-rpm > /dev/null || ! cargo-generate-rpm --version | grep -q "$CARGO_GENERATE_RPM_VERSION"; then
+          cargo install cargo-generate-rpm --version "$CARGO_GENERATE_RPM_VERSION" --locked
+        fi
+
     - name: Build Rust binary
       run: cargo build --release --target x86_64-unknown-linux-gnu
+
+    - name: Generate RPM package
+      run: cargo generate-rpm
+
+    - name: Verify RPM scriptlets
+      run: |
+        mkdir -p "${RUNNER_TEMP}/rpmdb"
+        rpm --dbpath "${RUNNER_TEMP}/rpmdb" -qp --scripts target/generate-rpm/*.rpm
+        if rpm --dbpath "${RUNNER_TEMP}/rpmdb" -qp --scripts target/generate-rpm/*.rpm | grep -q '%systemd_user_'; then
+          echo "RPM contains unexpanded systemd user-service macros"
+          exit 1
+        fi
 
     - name: Release
       uses: softprops/action-gh-release@v2
@@ -30,4 +54,4 @@ jobs:
       with:
         files: |
           target/x86_64-unknown-linux-gnu/release/hars-imp
-
+          target/generate-rpm/*.rpm
